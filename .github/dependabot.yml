@@ -1,0 +1,12 @@
+# Version-update PRs are unmergeable on a release mirror; security alerts stay on
+# (repository setting) and are handled upstream.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule: {interval: monthly}
+    open-pull-requests-limit: 0
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: monthly}
+    open-pull-requests-limit: 0
