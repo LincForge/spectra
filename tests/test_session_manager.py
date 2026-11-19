@@ -476,6 +476,60 @@ class TestDebugSessionManager:
         assert isinstance(port, int)
         assert port > 0
 
+    @patch("linc_spectra.core.session_manager.adb_remove_forward")
+    def test_close_all_tears_down_dap_and_jdb_sessions_and_reservations(
+        self, mock_remove_forward: MagicMock
+    ) -> None:
+        manager = self._make_manager()
+        client = MagicMock(spec=DAPClient)
+        dap = DebugSession(
+            session_id="dap1",
+            platform="android",
+            device_serial="DEV1",
+            package="com.example.dap",
+            client=client,
+            local_port=15001,
+        )
+        manager._sessions["dap1"] = dap
+
+        jdb = MagicMock()
+        jdb.session_id = "jdb1"
+        jdb.serial = "DEV1"
+        jdb.package = "com.example.jdb"
+        jdb.KIND = "jdb_method"
+        jdb.state.return_value = "armed"
+        manager._jdb_sessions["jdb1"] = jdb
+
+        jdb_cap = MagicMock()
+        jdb_cap.session_id = "jdb2"
+        jdb_cap.serial = "DEV2"
+        jdb_cap.package = "com.example.jdb2"
+        jdb_cap.KIND = "jdb_method"
+        jdb_cap.state.return_value = "captured"
+        manager._jdb_sessions["jdb2"] = jdb_cap
+
+        manager.reserve_target("android", "DEV3", "com.example.pending", session_id="res1")
+        assert manager.attaching_retry_in_s("res1") is not None
+
+        with patch("linc_spectra.core.session_manager.logger") as mock_logger:
+            closed = manager.close_all()
+            assert closed == 3
+            mock_logger.info.assert_called_once_with("debug_sessions_closed_all", count=3)
+
+            # Second call is an idempotent no-op and does not log again.
+            assert manager.close_all() == 0
+            mock_logger.info.assert_called_once()
+
+        client.disconnect.assert_called_once()
+        client.stop.assert_called_once()
+        mock_remove_forward.assert_called_once_with(15001, serial="DEV1")
+        jdb.close.assert_called_once()
+        jdb_cap.close.assert_called_once()
+        assert manager.list_sessions() == []
+        assert manager.attaching_retry_in_s("res1") is None
+        assert manager.closed_jdb_reason("jdb1") == "detached"
+        assert manager.closed_jdb_reason("jdb2") == "auto_captured"
+
 
 class TestSessionManagerNoCrucible:
     def test_no_crucible_import(self) -> None:

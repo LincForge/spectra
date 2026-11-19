@@ -26,8 +26,10 @@ collector thread the moment the breakpoint is hit, under a hard
 input-dispatch ANR and the triggering tap returns normally;
 ``collect_locals()`` then just hands out the cached result (reactor 884475d8).
 
-Only one debugger can hold a process's JDWP connection at a time — do not
-arm a jdb session while a DAP session is attached to the same app.
+Only one debugger can hold a process's JDWP connection at a time — this is
+enforced per spectra server process by ``DebugSessionManager.reserve_target``,
+which refuses a second DAP or jdb session on the same app until the existing
+session is detached or closed.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator
 from queue import Empty, Full, Queue
 from typing import IO, Protocol
@@ -50,12 +53,14 @@ from typing import IO, Protocol
 import structlog
 
 from .adb_subprocess import (
-    AdbNotFoundError,
+    AdbError,
     adb_forward_jdwp,
     adb_get_pid,
     adb_list_jdwp_pids,
     adb_remove_forward,
+    format_adb_called_process_error,
 )
+from .paths import is_jvm_banner, sanitize_diagnostic_lines, without_jvm_opt_env
 from .ports import find_free_local_port
 from .toolchain import jdb_usable
 from .validation import (
@@ -86,6 +91,8 @@ _EXCEPTION_SCOPES = ("uncaught", "caught", "all")
 _PROMPT_RE = re.compile(r"[^\s=][^=]*\[\d+\] ")
 _STEP_DONE_RE = re.compile(r"Step completed:|The application exited")
 
+JDB_ATTACH_TIMEOUT_S = 20.0  # default jdb attach response wait
+JDB_ARM_COMMAND_TIMEOUT_S = 10.0  # wait for jdb to confirm the breakpoint/catchpoint
 _READ_CAP_S = 0.7  # longest wait for one `locals` reply
 _STEP_TIMEOUT_S = 8.0  # longest wait for one manual `next`
 _SETTLE_S = 0.2  # grace for the prompt once a step's outcome line arrived
@@ -108,11 +115,42 @@ _READ_CHUNK = 65536
 _MAX_LINE_CHARS = 65536
 _TRUNCATED_MARKER = " \u2026[truncated]"
 _MAX_QUEUED_LINES = 10_000
+_MAX_QUEUED_CHARS = 8 * 1024 * 1024  # 8 MiB character budget for queued jdb stdout lines
+_WAIT_FOR_MAX_LINES = 64
 _READER_JOIN_S = 1.0
+_ATTACH_TAIL_LINES = 5
+_ATTACH_TAIL_CHARS = 500
+# The cause line (e.g. ``java.io.IOException: handshake failed ...``) leads the tail, capped.
+_ATTACH_CAUSE_CHARS = 200
+_ATTACH_CAUSE_RE = re.compile(r"Exception|Error:")
+_HANDSHAKE_RE = re.compile(r"handshake failed", re.IGNORECASE)
+# After stdout EOF, how long to wait for jdb's exit status before reporting it unknown.
+_EXIT_REAP_S = 0.5
+_HANDSHAKE_HINT = (
+    " — another debugger (Android Studio, another spectra process, or a leftover jdb) "
+    "holds this app's JDWP connection — close it and retry"
+)
 
 
 class JdbError(RuntimeError):
     """jdb attach/breakpoint/read failure with a caller-actionable message."""
+
+
+def _attach_tail(lines: list[str]) -> str:
+    """jdb's cause line, then its last <= 5 non-blank lines; <= 500 chars, home redacted.
+
+    The first ``Exception`` / ``Error:`` line names why jdb failed (its final
+    lines are only "Fatal error: / Unable to attach to target VM."), so it
+    leads the tail, capped, unless it is already among the last lines. The
+    last lines keep their END, so the final line always survives the cap.
+    """
+    kept = sanitize_diagnostic_lines(lines)
+    if not kept:
+        return ""
+    last = kept[-_ATTACH_TAIL_LINES:]
+    cause = next((ln for ln in kept if _ATTACH_CAUSE_RE.search(ln)), None)
+    head = "" if cause is None or cause in last else cause[:_ATTACH_CAUSE_CHARS] + "\n"
+    return head + "\n".join(last)[-(_ATTACH_TAIL_CHARS - len(head)) :]
 
 
 def _validated(validator: Callable[..., str], *args: str) -> str:
@@ -327,12 +365,59 @@ def _join_thread(thread: threading.Thread | None, timeout: float) -> None:
         thread.join(timeout)
 
 
+def _is_cause_line(line: str) -> bool:
+    """True when *line* is a non-banner jdb line naming an Exception or Error."""
+    return bool(_ATTACH_CAUSE_RE.search(line)) and not is_jvm_banner(line)
+
+
+def _finalize_wait_lines(first_cause: str | None, consumed: deque[str]) -> list[str]:
+    """Return bounded lines from ``_wait_for``, keeping the first cause line if evicted."""
+    if first_cause is not None and first_cause not in consumed:
+        return [first_cause, *consumed]
+    return list(consumed)
+
+
 def _close_proc_pipes(proc: subprocess.Popen[bytes]) -> None:
     """Close jdb stdin/stdout pipes so a blocked reader wakes up immediately."""
     for stream in (proc.stdin, proc.stdout):
         if stream is not None:
             with contextlib.suppress(OSError):
                 stream.close()
+
+
+class _BoundedLineQueue(Queue[str]):
+    """FIFO queue of jdb output lines bounded by both line count and character budget."""
+
+    def __init__(self, maxsize: int = 0, max_chars: int = 0) -> None:
+        self.max_chars = max_chars
+        super().__init__(maxsize=maxsize)
+
+    def _init(self, maxsize: int) -> None:
+        super()._init(maxsize)
+        self.queued_chars = 0
+        self.peak_queued_chars = 0
+
+    def _put(self, item: str) -> None:
+        super()._put(item)
+        self.queued_chars += len(item)
+        if self.queued_chars > self.peak_queued_chars:
+            self.peak_queued_chars = self.queued_chars
+
+    def _get(self) -> str:
+        item = super()._get()
+        self.queued_chars -= len(item)
+        return item
+
+    def put_nowait(self, item: str) -> None:
+        """Enqueue *item* without blocking, raising ``Full`` past count or char budget."""
+        with self.not_full:
+            if self.max_chars > 0 and self.queued_chars + len(item) > self.max_chars:
+                raise Full
+            if self.maxsize > 0 and self._qsize() >= self.maxsize:
+                raise Full
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
 
 
 class _JdbSessionBase:
@@ -371,7 +456,10 @@ class _JdbSessionBase:
         self.port = find_free_local_port()
         self.armed_at = time.monotonic()
         self._proc: subprocess.Popen[bytes] | None = None
-        self._lines: Queue[str] = Queue(maxsize=_MAX_QUEUED_LINES)
+        self._lines: _BoundedLineQueue = _BoundedLineQueue(
+            maxsize=_MAX_QUEUED_LINES,
+            max_chars=_MAX_QUEUED_CHARS,
+        )
         self._dropped_lines = 0
         self._closed = False
         self._close_lock = threading.Lock()
@@ -390,7 +478,11 @@ class _JdbSessionBase:
         return self._closed
 
     def _enqueue_line(self, line: str) -> None:
-        """Queue *line*; when full, drop the oldest line and count it."""
+        """Queue *line*; when full (line count or char budget), drop the oldest lines and count."""
+        max_chars = getattr(self._lines, "max_chars", _MAX_QUEUED_CHARS)
+        if max_chars > 0 and len(line) > max_chars:
+            self._dropped_lines += 1
+            return
         while True:
             try:
                 self._lines.put_nowait(line)
@@ -418,6 +510,13 @@ class _JdbSessionBase:
         """Closed, or jdb exited and every line it printed has been read."""
         return self._closed or (self._eof.is_set() and self._lines.empty())
 
+    def _exited_and_drained(self) -> bool:
+        """jdb exited and no reader is still queueing its output (so no line is missed)."""
+        if self._proc is None or self._proc.poll() is None:
+            return False
+        reader = self._reader_thread
+        return reader is None or not reader.is_alive()
+
     def _time_left(self, deadline: float) -> float:
         """Seconds left before *deadline*; none at all once the session has ended."""
         return 0.0 if self._ended() else deadline - time.monotonic()
@@ -436,21 +535,26 @@ class _JdbSessionBase:
     def _wait_for(self, pattern: str, timeout: float) -> tuple[re.Match[str] | None, list[str]]:
         """Read buffered jdb output until *pattern* matches, timeout, close or jdb's EOF.
 
-        Returns (match, all lines consumed while waiting).
+        Returns (match, bounded recent lines consumed while waiting plus first cause line).
         """
         deadline = time.monotonic() + timeout
-        consumed: list[str] = []
+        consumed: deque[str] = deque(maxlen=_WAIT_FOR_MAX_LINES)
+        first_cause: str | None = None
         compiled = re.compile(pattern)
         while (left := self._time_left(deadline)) > 0:
             try:
                 line = self._lines.get(timeout=min(left, _REPLY_POLL_S))
             except Empty:
+                if self._exited_and_drained():
+                    break
                 continue
+            if first_cause is None and _is_cause_line(line):
+                first_cause = line
             consumed.append(line)
             m = compiled.search(line)
             if m:
-                return m, consumed
-        return None, consumed
+                return m, _finalize_wait_lines(first_cause, consumed)
+        return None, _finalize_wait_lines(first_cause, consumed)
 
     def _drain(self) -> None:
         """Drop output nobody is waiting for any more (a late reply, a stale prompt)."""
@@ -560,8 +664,13 @@ class _JdbSessionBase:
                 )
 
             adb_forward_jdwp(self.port, pid, self.serial)
-        except AdbNotFoundError as exc:
+        except AdbError as exc:
             raise JdbError(str(exc)) from exc
+        except subprocess.CalledProcessError as exc:
+            msg = format_adb_called_process_error(
+                f"adb forward failed (exit code {exc.returncode})", exc
+            )
+            raise JdbError(msg) from exc
         self._workdir = tempfile.mkdtemp(prefix="spectra-jdb-")
         self._proc = subprocess.Popen(
             [jdb, "-attach", f"localhost:{self.port}"],
@@ -570,16 +679,43 @@ class _JdbSessionBase:
             stderr=subprocess.STDOUT,
             bufsize=0,
             cwd=self._workdir,
+            env=without_jvm_opt_env(),
         )
         self._reader_thread = threading.Thread(
             target=self._reader, daemon=True, name=self.session_id
         )
         self._reader_thread.start()
 
-        m, _ = self._wait_for(r"Initializing jdb|VM Started", timeout=attach_timeout)
+        m, lines = self._wait_for(r"Initializing jdb|VM Started", timeout=attach_timeout)
         if m is None:
-            raise JdbError(f"jdb did not attach to localhost:{self.port} in {attach_timeout}s")
+            raise self._attach_error(self._exit_code(), lines, attach_timeout)
         return pid
+
+    def _exit_code(self) -> int | None:
+        """jdb's exit status; after stdout EOF, briefly reap it (None if still unknown)."""
+        if self._proc is None:
+            return None
+        code = self._proc.poll()
+        if code is None and self._eof.is_set():
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                code = self._proc.wait(timeout=_EXIT_REAP_S)
+        return code
+
+    def _attach_error(
+        self, exit_code: int | None, lines: list[str], attach_timeout: float
+    ) -> JdbError:
+        """JdbError when jdb failed to attach: early exit / EOF with output tail, else timeout."""
+        if exit_code is None and not self._eof.is_set():
+            return JdbError(f"jdb did not attach to localhost:{self.port} in {attach_timeout}s")
+        sanitized = sanitize_diagnostic_lines(lines)
+        tail = _attach_tail(sanitized)
+        hint = _HANDSHAKE_HINT if any(_HANDSHAKE_RE.search(ln) for ln in sanitized) else ""
+        code = "unknown" if exit_code is None else exit_code
+        serial = self.serial or "device"
+        detail = f": {tail}{hint}" if tail else ""
+        return JdbError(
+            f"jdb exited (code {code}) before attaching to {self.package} on {serial}{detail}"
+        )
 
     def close(self) -> None:
         """Resume the debuggee and tear everything down (idempotent)."""
@@ -644,14 +780,14 @@ class JdbMethodSession(_JdbSessionBase):
         self._result: dict[str, object] | None = None
         self._capture_error: str | None = None
 
-    def arm(self, attach_timeout: float = 20.0) -> dict[str, object]:
+    def arm(self, attach_timeout: float = JDB_ATTACH_TIMEOUT_S) -> dict[str, object]:
         """Forward JDWP, attach jdb, and set the method-entry breakpoint."""
         try:
-            pid = self._attach(attach_timeout)
+            pid = self._attach(float(attach_timeout))
             self._send(f"stop in {self.method_fqn}")
             m, lines = self._wait_for(
                 r"Set breakpoint|Deferring breakpoint|Unable to set|ERROR|not found",
-                timeout=10,
+                timeout=JDB_ARM_COMMAND_TIMEOUT_S,
             )
             joined = "\n".join(lines)
             if m is None or "Unable" in joined or "ERROR" in joined or "not found" in joined:
@@ -678,7 +814,7 @@ class JdbMethodSession(_JdbSessionBase):
                 "pid": pid,
                 "auto_capture": self.auto_capture,
             }
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -898,14 +1034,14 @@ class JdbExceptionSession(_JdbSessionBase):
         self.exception_class = _validated(validate_fqn, exception_class, "exception_class")
         self.scope = scope
 
-    def arm(self, attach_timeout: float = 20.0) -> dict[str, object]:
+    def arm(self, attach_timeout: float = JDB_ATTACH_TIMEOUT_S) -> dict[str, object]:
         """Forward JDWP, attach jdb, and set the exception catchpoint."""
         try:
-            pid = self._attach(attach_timeout)
+            pid = self._attach(float(attach_timeout))
             self._send(f"catch {self.scope} {self.exception_class}")
             m, lines = self._wait_for(
                 r"Set (deferred )?(uncaught|caught|all)|Deferring|Unable|ERROR|Invalid",
-                timeout=10,
+                timeout=JDB_ARM_COMMAND_TIMEOUT_S,
             )
             joined = "\n".join(lines)
             if m is None or any(bad in joined for bad in ("Unable", "ERROR", "Invalid")):
@@ -930,7 +1066,7 @@ class JdbExceptionSession(_JdbSessionBase):
                 "catch": armed_state,
                 "pid": pid,
             }
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -1007,11 +1143,43 @@ class JdbRegistry(Protocol):
     spectra_sessions, closed by spectra_detach and reaped after a TTL.
     """
 
+    def reserve_target(
+        self,
+        platform: str,
+        device_serial: str | None,
+        package: str,
+        kind: str = "dap",
+        *,
+        session_id: str | None = None,
+    ) -> object: ...
+
+    def release_target(self, reservation: object) -> None: ...
+
     def add_jdb_session(self, session: _JdbSessionBase) -> None: ...
 
     def take_jdb_session(self, session_id: str) -> _JdbSessionBase | None: ...
 
     def peek_jdb_session(self, session_id: str) -> _JdbSessionBase | None: ...
+
+
+@contextlib.contextmanager
+def _reserved_jdb_target(
+    registry: JdbRegistry, session: _JdbSessionBase, kind: str
+) -> Iterator[None]:
+    """Reserve *session*'s target in *registry* before arming; release if arming fails."""
+    reserve = getattr(registry, "reserve_target", None)
+    release = getattr(registry, "release_target", None)
+    token = (
+        reserve("android", session.serial, session.package, kind, session_id=session.session_id)
+        if reserve is not None
+        else None
+    )
+    try:
+        yield
+    except BaseException:
+        if release is not None:
+            release(token)
+        raise
 
 
 def _peek(registry: JdbRegistry, session_id: str) -> _JdbSessionBase:
@@ -1052,8 +1220,9 @@ def arm_method_breakpoint(
         capture_steps=capture_steps,
         capture_budget_s=capture_budget_s,
     )
-    info = session.arm()
-    registry.add_jdb_session(session)
+    with _reserved_jdb_target(registry, session, "jdb-method"):
+        info = session.arm()
+        registry.add_jdb_session(session)
     return info
 
 
@@ -1086,8 +1255,9 @@ def arm_exception_breakpoint(
 ) -> dict[str, object]:
     """Create + arm a jdb exception session and register it for collection."""
     session = JdbExceptionSession(package, exception_class, scope=scope, serial=serial)
-    info = session.arm()
-    registry.add_jdb_session(session)
+    with _reserved_jdb_target(registry, session, "jdb-exception"):
+        info = session.arm()
+        registry.add_jdb_session(session)
     return info
 
 

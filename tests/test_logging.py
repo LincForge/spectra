@@ -1,7 +1,7 @@
 """Logging stays off stdout: ``_logging.configure`` and the ``bellows`` boot order.
 
 stdout is the MCP stdio protocol channel, so every log line — structlog or a
-stdlib handler FastMCP installs — must land on stderr.
+stdlib handler the SDK's MCPServer installs — must land on stderr.
 """
 
 from __future__ import annotations
@@ -78,13 +78,13 @@ def test_contract_configure_drops_stdout_handlers_on_mcp_logger() -> None:
     assert mcp_file in logging.getLogger("mcp").handlers
 
 
-def test_contract_fastmcp_construction_after_configure_keeps_handlers_on_stderr() -> None:
-    """[contract] FastMCP's own logging setup (run at construction) adds no stdout handler."""
-    from mcp.server.fastmcp import FastMCP
+def test_contract_mcpserver_construction_after_configure_keeps_handlers_on_stderr() -> None:
+    """[contract] MCPServer's own logging setup (run at construction) adds no stdout handler."""
+    from mcp.server.mcpserver import MCPServer
 
     logging.getLogger("mcp").addHandler(logging.StreamHandler(sys.stdout))
     _logging.configure()
-    FastMCP("stdio-probe")
+    MCPServer("stdio-probe")
     streams = _handler_streams()
     assert streams, "configure() must install a stderr handler on the root logger"
     assert all(stream is sys.stderr for stream in streams), streams
@@ -152,3 +152,44 @@ def test_bellows_configures_logging_before_server_run() -> None:
         result = CliRunner().invoke(cli_mod.cli, ["bellows"])
     assert result.exit_code == 0, result.output
     assert calls == ["configure", "run"]
+
+
+def test_contract_unexpected_tool_exception_traceback_omits_argument_locals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[contract] an unexpected exception inside a tool with an argument value
+    SENTINEL-ARG-123 writes a traceback to stderr that does not contain SENTINEL-ARG-123."""
+    import asyncio
+
+    from mcp import Client
+
+    from linc_spectra import mcp_server
+
+    monkeypatch.setenv("SPECTRA_USAGE_LOG", "off")
+    _logging.configure()
+    renderer = logging.getLogger().handlers[0].formatter.processors[-1]  # type: ignore[union-attr]
+    assert renderer._colors is False
+    assert renderer._exception_formatter is structlog.dev.plain_traceback
+
+    async def scenario() -> object:
+        with patch(
+            "linc_spectra.core.usage_stats.compute_usage_stats",
+            side_effect=RuntimeError("unexpected tool boom"),
+        ):
+            async with Client(mcp_server.server) as client:
+                return await client.call_tool(
+                    "spectra_usage_stats",
+                    {"server_filter": "SENTINEL-ARG-123"},
+                )
+
+    err_stream = io.StringIO()
+    out_stream = io.StringIO()
+    with patch.object(sys, "stderr", err_stream), patch.object(sys, "stdout", out_stream):
+        result = asyncio.run(scenario())
+    assert getattr(result, "is_error", False) is True
+    assert out_stream.getvalue() == ""
+    err_text = err_stream.getvalue()
+    assert "Traceback (most recent call last):" in err_text
+    assert "RuntimeError: unexpected tool boom" in err_text
+    assert "SENTINEL-ARG-123" not in err_text
+    assert "\x1b[" not in err_text

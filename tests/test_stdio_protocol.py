@@ -31,7 +31,13 @@ _PACKAGE = "com.example.app"
 _METHOD = "com.example.app.Repo.save"
 
 _FAKE_ADB = """\
+import os
 import sys
+
+log_path = os.environ.get("SPECTRA_TEST_ADB_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(" ".join(sys.argv[1:]) + "\\n")
 
 args = sys.argv[1:]
 if args[:1] == ["-s"]:
@@ -44,6 +50,56 @@ elif args[:1] == ["forward"]:
     pass
 else:
     sys.exit(1)
+"""
+
+_FAKE_KDA = """\
+import json
+import sys
+
+
+def _read_msg():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        text = line.decode("ascii").strip()
+        if not text:
+            break
+        k, _, v = text.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+
+
+def _send(msg):
+    body = json.dumps(msg).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("ascii") + body)
+    sys.stdout.buffer.flush()
+
+
+seq = 0
+while True:
+    req = _read_msg()
+    if req is None:
+        break
+    cmd = req.get("command", "")
+    seq += 1
+    _send(
+        {
+            "seq": seq,
+            "type": "response",
+            "request_seq": req["seq"],
+            "command": cmd,
+            "success": True,
+            "body": {},
+        }
+    )
+    if cmd == "initialize":
+        seq += 1
+        _send({"seq": seq, "type": "event", "event": "initialized"})
+    elif cmd == "disconnect":
+        break
 """
 
 _FAKE_JDB = """\
@@ -206,3 +262,199 @@ def test_contract_bellows_stdout_is_only_json_rpc(tmp_path: Path) -> None:
         assert isinstance(message, dict), line
         assert message.get("jsonrpc") == "2.0", line
     assert "jdb_method_breakpoint_armed" in stderr_text, stderr_text
+
+
+def test_contract_stdio_unknown_argument_is_an_error_result_naming_it(tmp_path: Path) -> None:
+    """[contract] Over real stdio on the mcp 2.x server, tools/list lists all 14 tools
+    and a tools/call with an unknown argument returns ``isError: true`` whose text names
+    that argument (strict_tools' ToolError reaches the client), and the server keeps
+    serving the next call."""
+    _write_fake(tmp_path, "adb", _FAKE_ADB)
+    _write_fake(tmp_path, "jdb", _FAKE_JDB)
+    proc = _spawn_server(tmp_path)
+    out_lines: queue.Queue[str] = queue.Queue()
+    threading.Thread(target=_pump_lines, args=(proc.stdout, out_lines), daemon=True).start()
+    threading.Thread(target=_pump_lines, args=(proc.stderr, queue.Queue()), daemon=True).start()
+    seen: list[str] = []
+    deadline = time.monotonic() + _DEADLINE_S
+    try:
+        _send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "stdio-contract", "version": "0"},
+                },
+            },
+        )
+        _await_response(out_lines, seen, 1, deadline)
+        _send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+        _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        listed = _await_response(out_lines, seen, 2, deadline)
+        names = {tool["name"] for tool in listed["result"]["tools"]}
+        assert len(names) == 14, names
+        assert {"spectra_sessions", "spectra_detach", "spectra_continue"} <= names
+        _send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "spectra_sessions", "arguments": {"hallucinated_flag": True}},
+            },
+        )
+        rejected = _await_response(out_lines, seen, 3, deadline)
+        assert "error" not in rejected, rejected
+        assert rejected["result"]["isError"] is True, rejected
+        text = " ".join(part.get("text", "") for part in rejected["result"]["content"])
+        assert "hallucinated_flag" in text, rejected
+        _send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "spectra_sessions", "arguments": {}},
+            },
+        )
+        ok = _await_response(out_lines, seen, 4, deadline)
+        assert "error" not in _tool_payload(ok), ok
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_contract_closing_server_detaches_dap_and_jdb_forwards_and_temp_dirs(
+    tmp_path: Path,
+) -> None:
+    """[contract] closing the server with one DAP and one jdb session live issues an
+    ``adb forward --remove`` for each forward and leaves no ``spectra-jdb-*`` dir."""
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    adb_log = tmp_path / "adb_calls.log"
+    _write_fake(tmp_path, "adb", _FAKE_ADB)
+    _write_fake(tmp_path, "jdb", _FAKE_JDB)
+    _write_fake(tmp_path, "kotlin-debug-adapter", _FAKE_KDA)
+
+    env = {
+        "PATH": str(tmp_path),
+        "HOME": str(tmp_path),
+        "LINC_HOME": str(tmp_path / "linc"),
+        "SPECTRA_USAGE_LOG": "off",
+        "TMPDIR": str(tmp_dir),
+        "TEMP": str(tmp_dir),
+        "TMP": str(tmp_dir),
+        "SPECTRA_TEST_ADB_LOG": str(adb_log),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "from linc_spectra.cli import main; main()", "bellows"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+        cwd=tmp_path,
+    )
+    out_lines: queue.Queue[str] = queue.Queue()
+    threading.Thread(target=_pump_lines, args=(proc.stdout, out_lines), daemon=True).start()
+    threading.Thread(target=_pump_lines, args=(proc.stderr, queue.Queue()), daemon=True).start()
+    seen: list[str] = []
+    deadline = time.monotonic() + _DEADLINE_S
+    try:
+        _send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "shutdown-contract", "version": "0"},
+                },
+            },
+        )
+        _await_response(out_lines, seen, 1, deadline)
+        _send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+        # 1. Start one live Android DAP session.
+        _send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "spectra_attach",
+                    "arguments": {
+                        "device": _SERIAL,
+                        "package": "com.example.dapapp",
+                        "platform": "android",
+                    },
+                },
+            },
+        )
+        dap_resp = _await_response(out_lines, seen, 2, deadline)
+        dap_payload = _tool_payload(dap_resp)
+        assert "session_id" in dap_payload, dap_payload
+
+        # 2. Start one live armed jdb session.
+        _send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "spectra_method_breakpoint",
+                    "arguments": {
+                        "device": _SERIAL,
+                        "package": "com.example.jdbapp",
+                        "method_fqn": _METHOD,
+                        "auto_capture": False,
+                    },
+                },
+            },
+        )
+        jdb_resp = _await_response(out_lines, seen, 3, deadline)
+        jdb_payload = _tool_payload(jdb_resp)
+        assert "session_id" in jdb_payload, jdb_payload
+
+        # Confirm both sessions are live and a spectra-jdb-* dir exists before exit.
+        _send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "spectra_sessions", "arguments": {}},
+            },
+        )
+        listed = _tool_payload(_await_response(out_lines, seen, 4, deadline))
+        assert listed["count"] == 2, listed
+        assert len(list(tmp_dir.glob("spectra-jdb-*"))) == 1
+
+        # Close server stdin -> clean EOF shutdown.
+        assert proc.stdin is not None
+        proc.stdin.close()
+        proc.wait(timeout=15)
+        assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    adb_lines = adb_log.read_text(encoding="utf-8").splitlines()
+    forwards = [ln for ln in adb_lines if " forward tcp:" in ln]
+    removes = [ln for ln in adb_lines if " forward --remove tcp:" in ln]
+    assert len(forwards) == 2, adb_lines
+    forwarded_ports = {ln.split("tcp:")[1].split()[0] for ln in forwards}
+    removed_ports = {ln.split("tcp:")[1].split()[0] for ln in removes}
+    assert len(forwarded_ports) == 2
+    assert removed_ports == forwarded_ports, adb_lines
+    assert list(tmp_dir.glob("spectra-jdb-*")) == []

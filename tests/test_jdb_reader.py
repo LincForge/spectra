@@ -342,6 +342,118 @@ class TestBoundedLineQueueContract:
         # Oldest 90,000 lines were dropped; the first surviving item is line-90000.
         assert session._lines.get_nowait() == "line-90000"
 
+    def test_contract_200k_line_flood_during_attach_keeps_queued_chars_within_budget(
+        self,
+    ) -> None:
+        """[contract] A fake jdb writing 200,000-char lines for the attach timeout keeps
+        the queued characters <= the budget (and peak traced allocation < 100 MB)."""
+        import tracemalloc
+
+        session = JdbMethodSession("com.example.app", FQN, serial="emulator-5554")
+        budget = jdb_session._MAX_QUEUED_CHARS
+        assert 0 < budget <= 8 * 1024 * 1024
+
+        # 1) Direct flood of 200,000-char lines into _pump / _enqueue_line (~32.7 MB after
+        #    _MAX_LINE_CHARS capping if there were no byte budget -> capped to <= 8 MiB).
+        one_line = ("X" * 200_000 + "\n").encode("utf-8")
+        stream = _ChunkedBytesStream([one_line] * 300)
+        jdb_session._pump(stream, session._enqueue_line)
+
+        assert session._lines.queued_chars <= budget
+        assert session._lines.peak_queued_chars <= budget
+        assert session._lines.peak_queued_chars > 0
+        assert session._dropped_lines > 0
+        queued = list(session._lines.queue)
+        assert sum(len(ln) for ln in queued) == session._lines.queued_chars
+
+        # 2) Full arm(attach_timeout=0.4) with a fake jdb continuously emitting 200k-char lines.
+        class _Flood200kStdout:
+            def __init__(self) -> None:
+                self.closed = False
+                self._payload = ("Y" * 200_000 + "\n").encode("utf-8")
+                self._offset = 0
+
+            def read1(self, size: int = -1) -> bytes:
+                if self.closed:
+                    return b""
+                n = len(self._payload) if size is None or size < 0 else size
+                end = self._offset + n
+                if end <= len(self._payload):
+                    chunk = self._payload[self._offset : end]
+                    self._offset = end if end < len(self._payload) else 0
+                    return chunk
+                chunk = self._payload[self._offset :]
+                self._offset = 0
+                return chunk
+
+            def read(self, size: int = -1) -> bytes:
+                return self.read1(size)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _Flood200kProc:
+            def __init__(self, *_a: Any, **_kw: Any) -> None:
+                self.stdout = _Flood200kStdout()
+                self.stdin = io.BytesIO()
+
+            def poll(self) -> int | None:
+                return None
+
+            def wait(self, timeout: float = 0) -> int:
+                return 0
+
+            def kill(self) -> None:
+                self.stdout.close()
+
+        attach_session = JdbMethodSession("com.example.app", FQN, serial="emulator-5554")
+        patches = list(_patched({}))
+        patches[0] = patch.object(jdb_session.subprocess, "Popen", _Flood200kProc)
+
+        import pytest
+
+        tracemalloc.start()
+        try:
+            with pytest.raises(jdb_session.JdbError, match="did not attach"):
+                _with_patches(patches, lambda: attach_session.arm(attach_timeout=0.4))
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert attach_session._lines.peak_queued_chars <= budget
+        assert attach_session._lines.queued_chars <= budget
+        assert peak_bytes < 100 * 1024 * 1024
+
+    def test_char_budget_evicts_multiple_small_lines_and_tracks_reads(self) -> None:
+        """Char-budget eviction drops oldest lines until the new line fits, handles
+        oversized single lines without looping, and decrements queued_chars on read."""
+        session = JdbMethodSession("com.example.app", FQN, serial="emulator-5554")
+        session._lines.max_chars = 100
+
+        for i in range(10):
+            session._enqueue_line(f"small-{i:03d}")  # 9 chars each -> 90 total
+        assert session._lines.queued_chars == 90
+        assert session._dropped_lines == 0
+
+        # Enqueue a 55-char line: needs <= 45 remaining, so 5 oldest 9-char lines drop
+        # (90 - 45 = 45 left; 45 + 55 = 100 <= 100).
+        big = "B" * 55
+        session._enqueue_line(big)
+        assert session._dropped_lines == 5
+        assert session._lines.queued_chars == 100
+        assert session._lines.qsize() == 6
+
+        # Single line larger than max_chars is dropped without looping or altering queue.
+        session._enqueue_line("Z" * 101)
+        assert session._dropped_lines == 6
+        assert session._lines.queued_chars == 100
+        assert session._lines.qsize() == 6
+
+        # Draining decrements queued_chars back to zero.
+        session._drain()
+        assert session._lines.qsize() == 0
+        assert session._lines.queued_chars == 0
+
     def test_dropped_lines_reported_in_manual_auto_and_exception_results(self) -> None:
         """Collect results include dropped_lines when non-zero and omit it when zero."""
         reg = _Registry()

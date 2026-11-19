@@ -159,6 +159,28 @@ class TestBootHealthWarnings:
             result = CliRunner().invoke(cli_mod.cli, ["bellows"])
             expected = cli_mod._boot_health_warnings()[0]
         assert result.exit_code == 0
-        assert result.stderr == expected
+        assert result.stderr == expected + "\n"
+        assert result.stdout == ""
+        mock_server.run.assert_called_once_with(transport="stdio")
+
+    def test_bellows_boots_silently_when_adapter_present(self) -> None:
+        """No warning means nothing on stderr, not even a blank line."""
+        from unittest.mock import MagicMock, patch
+
+        from click.testing import CliRunner
+
+        from linc_spectra import cli as cli_mod
+
+        mock_server = MagicMock()
+        with (
+            patch(
+                "linc_spectra.core.jdwp_bridge.JDWPBridge._find_adapter",
+                return_value="/x/kotlin-debug-adapter",
+            ),
+            patch("linc_spectra.mcp_server.server", mock_server),
+        ):
+            result = CliRunner().invoke(cli_mod.cli, ["bellows"])
+        assert result.exit_code == 0
+        assert result.stderr == ""
         assert result.stdout == ""
         mock_server.run.assert_called_once_with(transport="stdio")

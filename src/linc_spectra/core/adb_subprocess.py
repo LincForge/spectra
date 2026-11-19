@@ -10,6 +10,7 @@ import contextlib
 import subprocess
 from typing import Any
 
+from .paths import sanitize_diagnostic_lines
 from .validation import validate_android_serial, validate_package
 
 # `adb forward` normally returns in milliseconds; a wedged adb server (common
@@ -18,10 +19,20 @@ ADB_FORWARD_TIMEOUT_S = 10
 ADB_NOT_FOUND_MESSAGE = (
     "adb not found on PATH: install Android SDK platform-tools; run `spectra doctor`"
 )
+_ADB_ERROR_MAX_LINES = 5
+_ADB_ERROR_MAX_CHARS = 500
 
 
-class AdbNotFoundError(RuntimeError):
+class AdbError(RuntimeError):
+    """Base error for ADB subprocess failures."""
+
+
+class AdbNotFoundError(AdbError):
     """Raised when the ``adb`` executable cannot be found on ``PATH``."""
+
+
+class AdbCommandError(AdbError):
+    """Raised when ``adb`` exits non-zero with a diagnostic error."""
 
 
 def _adb_cmd(args: list[str], serial: str | None = None) -> list[str]:
@@ -47,6 +58,34 @@ def _run_adb(cmd: list[str], *, timeout: float, **kwargs: Any) -> subprocess.Com
         raise AdbNotFoundError(ADB_NOT_FOUND_MESSAGE) from exc
 
 
+def sanitize_adb_stderr(raw: bytes | str | None) -> str:
+    """Sanitize and bound ADB stderr/output text for caller-facing errors."""
+    lines = sanitize_diagnostic_lines([_decode_stream_output(raw)])
+    return "\n".join(lines[-_ADB_ERROR_MAX_LINES:])[-_ADB_ERROR_MAX_CHARS:]
+
+
+def format_adb_called_process_error(prefix: str, exc: subprocess.CalledProcessError) -> str:
+    """Append sanitized stderr (or *exc*) to *prefix* for caller-facing ADB errors."""
+    detail = sanitize_adb_stderr(exc.stderr) or str(exc)
+    return f"{prefix}: {detail}"
+
+
+def _raise_if_adb_failed(
+    result: subprocess.CompletedProcess[str],
+    *,
+    allow_empty_exit_one: bool = False,
+) -> None:
+    """Raise ``AdbCommandError`` when *result* indicates an ADB failure."""
+    if result.returncode == 0:
+        return
+    detail = sanitize_adb_stderr(result.stderr) or sanitize_adb_stderr(result.stdout)
+    if detail:
+        raise AdbCommandError(f"adb failed (exit code {result.returncode}): {detail}")
+    if allow_empty_exit_one and result.returncode == 1:
+        return
+    raise AdbCommandError(f"adb failed (exit code {result.returncode})")
+
+
 def adb_get_pid(package: str, serial: str | None = None) -> int | None:
     """Get the PID of a running package, or ``None`` if not running.
 
@@ -55,11 +94,14 @@ def adb_get_pid(package: str, serial: str | None = None) -> int | None:
 
     Raises:
         InvalidInputError: *package* or *serial* is not well-formed.
+        AdbNotFoundError: ``adb`` is not on ``PATH``.
+        AdbCommandError: ``adb`` exited non-zero with an error (e.g. device not found).
     """
     validate_package(package)
     cmd = _adb_cmd(["shell", "pidof", package], serial=serial)
     try:
         result = _run_adb(cmd, timeout=5)
+        _raise_if_adb_failed(result, allow_empty_exit_one=True)
         text = result.stdout.strip()
         if not text:
             return None
@@ -80,11 +122,14 @@ def adb_list_jdwp_pids(serial: str | None = None) -> set[int]:
     with "Cannot find debuggable PID" (reactor 8b9b0e86).
 
     Skips non-numeric lines (ADB daemon messages).
+
+    Raises:
+        AdbNotFoundError: ``adb`` is not on ``PATH``.
+        AdbCommandError: ``adb`` exited non-zero instead of streaming.
     """
     try:
         result = _run_adb(_adb_cmd(["jdwp"], serial=serial), timeout=2)
-        # adb exited on its own — error path (e.g. no device); stdout may
-        # still carry PID lines.
+        _raise_if_adb_failed(result)
         out = _decode_stream_output(result.stdout)
     except subprocess.TimeoutExpired as exc:
         out = _decode_stream_output(exc.output)
@@ -97,7 +142,7 @@ def _decode_stream_output(raw: bytes | str | None) -> str:
     ``TimeoutExpired.output`` is bytes even when the run used ``text=True``
     (CPython quirk); a clean exit's ``stdout`` is str or None.
     """
-    if not raw:
+    if not isinstance(raw, bytes | str):
         return ""
     return raw.decode(errors="replace") if isinstance(raw, bytes) else raw
 

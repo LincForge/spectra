@@ -64,7 +64,7 @@ linc-spectra exposes <!-- SPECTRA:TOOL-COUNT -->14<!-- /SPECTRA:TOOL-COUNT --> M
 | Tool | Description |
 |------|-------------|
 | `spectra_attach` | Attach a DAP debugger to a running debuggable app (Android JDWP or iOS Simulator LLDB) |
-| `spectra_detach` | Detach the debugger, remove port forwards, and clean up the session |
+| `spectra_detach` | Detach the debugger, remove port forwards, and clean up the session (for an attach still in progress it returns `state: "attaching"` with `retry_in_s`) |
 | `spectra_sessions` | List all active debug sessions |
 
 ### Stepping
@@ -73,7 +73,7 @@ linc-spectra exposes <!-- SPECTRA:TOOL-COUNT -->14<!-- /SPECTRA:TOOL-COUNT --> M
 |------|-------------|
 | `spectra_breakpoint` | Set `file:line` breakpoints on local source files |
 | `spectra_continue` | Resume execution and wait for the next breakpoint or stop event |
-| `spectra_step` | Step `next` (over), `in` (into), or `out` (out of the current frame) |
+| `spectra_step` | Step `next` (over), `step_in` (into), or `step_out` (out of the current frame) |
 
 ### Inspection
 
@@ -102,7 +102,8 @@ linc-spectra exposes <!-- SPECTRA:TOOL-COUNT -->14<!-- /SPECTRA:TOOL-COUNT --> M
 
 - **Upstream `kotlin-debug-adapter` exception breakpoints do not work:** use `spectra_exception_breakpoint` (the `jdb` catchpoint) instead.
 - **`file:line` breakpoints report `verified: true` even without local sources:** `kotlin-debug-adapter` marks non-existent paths as verified even though they can never bind; `spectra_breakpoint` attaches a `warning` field when `source_path` is missing locally (use `spectra_method_breakpoint` when you do not have the source checkout).
-- **One debugger per process:** a target process exposes a single JDWP connection at a time — detach any active DAP session before arming a `jdb` session on the same app (and vice versa).
+- **One debugger per target, per spectra server:** a spectra server allows one DAP or `jdb` session per app on a device. Attaching or arming while an established session holds the same app fails at once with an error naming that session (`spectra_detach` it first); if another attach is still in progress, the error reports that the attach is in progress and when it times out. Device aliases are normalized, so `booted` and a simulator's UDID (any case), or `emulator-5554` and `localhost:5555`, count as the same target. Other spectra servers and other debuggers (Android Studio, a separate `jdb`) are not coordinated: the target still accepts only one JDWP connection, so close them before attaching.
+- **Attach errors carry a sanitized output excerpt:** when `jdb` or a debug adapter fails to attach, the error includes a short excerpt of its output with ANSI escapes and control characters stripped, `Picked up JAVA_TOOL_OPTIONS` style JVM banner lines dropped, and your home directory shown as `~`.
 - **iOS simulator only:** iOS debugging via `lldb-dap` supports booted iOS simulators on macOS only (experimental; physical iOS devices are not supported).
 - **iOS `spectra_evaluate` takes expressions only:** iOS expressions run in `lldb-dap`'s expression-only (`watch`) context and LLDB commands (such as backtick-prefixed commands) are refused.
 - **`jdb` renders values as text:** a debuggee string containing line breaks can add a fake `name = value` line to a `jdb` reply (`spectra` keeps the first value of a name within a reply).

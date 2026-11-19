@@ -4,11 +4,16 @@ Manages active debug sessions, providing persistent state (DAP client,
 port forwards, thread/frame info) that MCP tools can reference by
 session_id.
 
-Module-level singleton pattern — one manager per process.
+Module-level singleton pattern — one manager per process. The
+one-debugger-per-target reservation guarantee is enforced
+per spectra server process (in-memory); other processes on the host are not
+coordinated.
 """
 
 from __future__ import annotations
 
+import math
+import re
 import threading
 import time
 import uuid
@@ -19,7 +24,9 @@ from typing import Any
 import structlog
 
 from .adb_subprocess import adb_remove_forward
-from .dap_client import DAPClient
+from .dap_client import DAP_ATTACH_TIMEOUT_SECONDS, DAP_INITIALIZE_TIMEOUT_SECONDS, DAPClient
+from .ios_subprocess import ios_get_booted_udid
+from .jdb_session import JDB_ARM_COMMAND_TIMEOUT_S, JDB_ATTACH_TIMEOUT_S
 from .ports import find_free_local_port
 
 logger = structlog.get_logger()
@@ -29,6 +36,12 @@ _SESSION_TIMEOUT_SECONDS = 600
 
 # Cleanup interval: check every 60 seconds
 _CLEANUP_INTERVAL_SECONDS = 60
+
+# Maximum seconds an in-flight attach reservation is expected to take before
+# timing out, derived from the real phase timeouts (DAP: initialize + attach;
+# jdb: attach + the breakpoint/catchpoint confirmation wait).
+_DAP_ATTACH_TIMEOUT_SECONDS = DAP_INITIALIZE_TIMEOUT_SECONDS + DAP_ATTACH_TIMEOUT_SECONDS
+_JDB_ATTACH_TIMEOUT_SECONDS = math.ceil(JDB_ATTACH_TIMEOUT_S + JDB_ARM_COMMAND_TIMEOUT_S)
 
 # An armed jdb session (spectra_method_breakpoint / spectra_exception_breakpoint)
 # that is never collected is closed after this long. Closing resumes the app:
@@ -49,6 +62,166 @@ _DEAD_SESSION_GRACE_SECONDS = 60
 # whole-process stop was first reported for another thread (lldb-dap sends
 # them back to back).
 _OWN_STOP_GRACE_SECONDS = 0.2
+
+_KIND_MAP: dict[str, str] = {
+    "jdb_method": "jdb-method",
+    "jdb_exception": "jdb-exception",
+}
+
+_EMULATOR_SERIAL_RE = re.compile(r"emulator-(\d+)", re.IGNORECASE)
+_LOOPBACK_ADB_RE = re.compile(r"(?:localhost|127\.0\.0\.1):(\d+)", re.IGNORECASE)
+
+
+def _normalize_kind(kind: str) -> str:
+    """Map internal session kind names (e.g. ``jdb_method``) to public kind labels."""
+    return _KIND_MAP.get(kind, kind)
+
+
+def _attach_timeout_seconds(kind: str) -> int:
+    """In-flight attach reservation timeout budget in seconds for *kind*."""
+    if _normalize_kind(kind).startswith("jdb"):
+        return _JDB_ATTACH_TIMEOUT_SECONDS
+    return _DAP_ATTACH_TIMEOUT_SECONDS
+
+
+def _normalize_android_serial(serial: str) -> str:
+    """Normalize Android emulator aliases to ``emulator-NNNN``.
+
+    ADB maps an emulator's console port ``NNNN`` (``emulator-NNNN``) to local
+    ADB port ``NNNN + 1`` (``localhost:<NNNN+1>`` / ``127.0.0.1:<NNNN+1>``).
+    """
+    emu_match = _EMULATOR_SERIAL_RE.fullmatch(serial)
+    if emu_match is not None:
+        return f"emulator-{int(emu_match.group(1))}"
+    loopback_match = _LOOPBACK_ADB_RE.fullmatch(serial)
+    if loopback_match is not None:
+        port = int(loopback_match.group(1))
+        if port > 0:
+            return f"emulator-{port - 1}"
+    return serial
+
+
+def _normalize_ios_serial(serial: str) -> str:
+    """Normalize iOS simulator identifiers: resolve ``booted`` and lower-case UDIDs."""
+    lowered = serial.lower()
+    if lowered == "booted":
+        resolved = ios_get_booted_udid()
+        if resolved:
+            return resolved.lower()
+    return lowered
+
+
+def _target_key(platform: str, serial: str | None, package: str) -> tuple[str, str, str]:
+    """Normalized ``(platform, serial, package)`` key (per spectra server process)."""
+    norm_platform = platform.strip().lower()
+    raw_serial = (serial or "").strip()
+    if norm_platform == "ios":
+        norm_serial = _normalize_ios_serial(raw_serial)
+    elif norm_platform == "android":
+        norm_serial = _normalize_android_serial(raw_serial)
+    else:
+        norm_serial = raw_serial
+    return (norm_platform, norm_serial, package.strip())
+
+
+def _targets_conflict(a: tuple[str, str, str], b: tuple[str, str, str]) -> bool:
+    """Whether two ``(platform, serial, package)`` keys refer to the same target.
+
+    An empty serial (jdb ``serial=None`` auto-picks the only device) or an
+    unresolved iOS ``booted`` alias conflicts with any session on the same
+    ``(platform, package)``.
+    """
+    if a[0] != b[0] or a[2] != b[2]:
+        return False
+    if not a[1] or not b[1] or a[1] == b[1]:
+        return True
+    return a[0] == "ios" and "booted" in (a[1], b[1])
+
+
+class TargetBusyError(RuntimeError):
+    """Raised when a target app already has a live or reserved debug session."""
+
+    def __init__(
+        self,
+        package: str,
+        device_serial: str,
+        session_id: str,
+        kind: str,
+        *,
+        attaching: bool = False,
+        expires_in_seconds: int | None = None,
+    ) -> None:
+        self.package = package
+        self.device_serial = device_serial
+        self.session_id = session_id
+        self.kind = kind
+        self.attaching = attaching
+        self.expires_in_seconds = (
+            (
+                _attach_timeout_seconds(kind)
+                if expires_in_seconds is None
+                else max(0, expires_in_seconds)
+            )
+            if attaching
+            else None
+        )
+        serial_label = device_serial or "device"
+        if attaching:
+            super().__init__(
+                f"{package} on {serial_label} already has a debugger attach ({kind}) "
+                f"in progress (will time out in {self.expires_in_seconds}s); "
+                "wait for it to finish"
+            )
+        else:
+            super().__init__(
+                f"{package} on {serial_label} already has debugger session "
+                f"{session_id} ({kind}); spectra_detach it first"
+            )
+
+    def to_error_dict(self) -> dict[str, Any]:
+        """Structured error response for MCP tools."""
+        if self.attaching:
+            return {
+                "error": str(self),
+                "validation_error": False,
+                "state": "attaching",
+                "expires_in_seconds": self.expires_in_seconds,
+            }
+        return {
+            "error": str(self),
+            "validation_error": False,
+            "session_id": self.session_id,
+        }
+
+
+@dataclass(frozen=True)
+class TargetReservation:
+    """In-flight target reservation token."""
+
+    key: tuple[str, str, str]
+    session_id: str
+    kind: str
+    device_serial: str | None = None
+    started_at: float = field(default_factory=time.monotonic)
+
+
+def _reservation_remaining(res: TargetReservation, now: float) -> int:
+    """Seconds left before an in-flight attach reservation times out."""
+    budget = _attach_timeout_seconds(res.kind)
+    return max(0, math.ceil(budget - (now - res.started_at)))
+
+
+def _reservation_summary(res: TargetReservation, now: float) -> dict[str, Any]:
+    """An in-flight target reservation's listing row while attach is in progress."""
+    return {
+        "session_id": res.session_id,
+        "kind": res.kind,
+        "platform": res.key[0],
+        "device_serial": res.device_serial or res.key[1] or None,
+        "package": res.key[2],
+        "state": "attaching",
+        "expires_in_seconds": _reservation_remaining(res, now),
+    }
 
 
 def _stop_of_thread(thread_id: int) -> Callable[[dict[str, Any]], bool]:
@@ -134,6 +307,7 @@ class DebugSession:
     last_activity: float = field(default_factory=time.monotonic)
     stopped_thread_id: int | None = None
     stopped_reason: str | None = None
+    target_key: tuple[str, str, str] | None = field(default=None, repr=False, compare=False)
     # Serializes tool calls on this session: tools run in parallel worker
     # threads, and resume -> wait -> record-stop must not interleave (#45).
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
@@ -252,7 +426,8 @@ class DebugSession:
 class DebugSessionManager:
     """Manages active debug sessions.
 
-    Thread-safe. Creates/retrieves/removes sessions by ID.
+    Thread-safe. Creates/retrieves/removes sessions by ID and enforces
+    the one-debugger-per-target guarantee per spectra server process.
     Daemon thread reaps sessions after inactivity timeout.
     """
 
@@ -268,11 +443,91 @@ class DebugSessionManager:
         self._jdb_sessions: dict[str, Any] = {}
         # Recently closed jdb session IDs -> (reason, closed_at_monotonic).
         self._closed_jdb: dict[str, tuple[str, float]] = {}
+        # In-flight target reservations keyed by (platform, serial, package).
+        self._reservations: dict[tuple[str, str, str], TargetReservation] = {}
         self._lock = threading.Lock()
 
         # Start cleanup daemon
         self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
         self._cleanup_thread.start()
+
+    def _iter_active_targets_locked(
+        self, now: float
+    ) -> list[tuple[tuple[str, str, str], str, str, int | None]]:
+        """All reserved and registered ``(key, session_id, kind, expires_in_s)`` entries."""
+        active: list[tuple[tuple[str, str, str], str, str, int | None]] = [
+            (res.key, res.session_id, res.kind, _reservation_remaining(res, now))
+            for res in self._reservations.values()
+        ]
+        for s in self._sessions.values():
+            s_key = s.target_key or _target_key(s.platform, s.device_serial, s.package)
+            active.append((s_key, s.session_id, "dap", None))
+        for j in self._jdb_sessions.values():
+            active.append(
+                (
+                    _target_key("android", j.serial, j.package),
+                    j.session_id,
+                    _normalize_kind(j.KIND),
+                    None,
+                )
+            )
+        return active
+
+    def _drop_reservation_locked(self, session_id: str) -> None:
+        """Remove any in-flight reservation for *session_id* (caller holds ``self._lock``)."""
+        stale = [k for k, res in self._reservations.items() if res.session_id == session_id]
+        for k in stale:
+            del self._reservations[k]
+
+    def reserve_target(
+        self,
+        platform: str,
+        device_serial: str | None,
+        package: str,
+        kind: str = "dap",
+        *,
+        session_id: str | None = None,
+    ) -> TargetReservation:
+        """Atomically reserve ``(platform, serial, package)`` per spectra server process."""
+        key = _target_key(platform, device_serial, package)
+        raw_serial = (device_serial or "").strip()
+        norm_kind = _normalize_kind(kind)
+        now = time.monotonic()
+        with self._lock:
+            for (
+                existing_key,
+                existing_sid,
+                existing_kind,
+                expires_in_s,
+            ) in self._iter_active_targets_locked(now):
+                if _targets_conflict(key, existing_key):
+                    serial_label = raw_serial or existing_key[1]
+                    raise TargetBusyError(
+                        key[2],
+                        serial_label,
+                        existing_sid,
+                        existing_kind,
+                        attaching=expires_in_s is not None,
+                        expires_in_seconds=expires_in_s,
+                    )
+            sid = session_id or str(uuid.uuid4())[:8]
+            token = TargetReservation(
+                key=key,
+                session_id=sid,
+                kind=norm_kind,
+                device_serial=raw_serial or None,
+                started_at=now,
+            )
+            self._reservations[key] = token
+            return token
+
+    def release_target(self, reservation: TargetReservation | None) -> None:
+        """Release an in-flight target reservation if still held."""
+        if reservation is None:
+            return
+        with self._lock:
+            if self._reservations.get(reservation.key) is reservation:
+                del self._reservations[reservation.key]
 
     def create_session(
         self,
@@ -295,44 +550,52 @@ class DebugSessionManager:
         Raises:
             Exception: If attachment fails.
         """
-        session_id = str(uuid.uuid4())[:8]
-        local_port = None
-
-        if platform == "android":
-            from .jdwp_bridge import JDWPBridge
-
-            bridge = JDWPBridge()
-            local_port = self._find_free_port()
-            client = bridge.attach(
-                package=package,
-                serial=device_serial,
-                project_root=project_root,
-                port=local_port,
-            )
-        elif platform == "ios":
-            from .lldb_bridge import LLDBBridge
-
-            bridge = LLDBBridge()
-            client = bridge.attach(
-                bundle_id=package,
-                udid=device_serial,
-                project_root=project_root,
-            )
-        else:
+        if platform not in ("android", "ios"):
             raise ValueError(f"Unsupported platform: {platform}")
 
-        session = DebugSession(
-            session_id=session_id,
-            platform=platform,
-            device_serial=device_serial,
-            package=package,
-            client=client,
-            project_root=project_root,
-            local_port=local_port,
-        )
+        reservation = self.reserve_target(platform, device_serial, package)
+        session_id = reservation.session_id
+        local_port = None
 
-        with self._lock:
-            self._sessions[session_id] = session
+        try:
+            if platform == "android":
+                from .jdwp_bridge import JDWPBridge
+
+                bridge = JDWPBridge()
+                local_port = self._find_free_port()
+                client = bridge.attach(
+                    package=package,
+                    serial=device_serial,
+                    project_root=project_root,
+                    port=local_port,
+                )
+            else:
+                from .lldb_bridge import LLDBBridge
+
+                bridge = LLDBBridge()
+                client = bridge.attach(
+                    bundle_id=package,
+                    udid=device_serial,
+                    project_root=project_root,
+                )
+
+            session = DebugSession(
+                session_id=session_id,
+                platform=platform,
+                device_serial=device_serial,
+                package=package,
+                client=client,
+                project_root=project_root,
+                local_port=local_port,
+                target_key=reservation.key,
+            )
+
+            with self._lock:
+                self._drop_reservation_locked(session_id)
+                self._sessions[session_id] = session
+        except BaseException:
+            self.release_target(reservation)
+            raise
 
         # If the target was already suspended on attach, the adapter fires a
         # 'stopped' event that nothing else consumes. Poll for it with a short,
@@ -378,6 +641,26 @@ class DebugSessionManager:
         """
         return self._close_session(session_id, "detached")
 
+    def close_all(self) -> int:
+        """Detach and tear down every live DAP and jdb session (idempotent)."""
+        with self._lock:
+            sessions: list[Any] = [self._sessions.pop(sid) for sid in list(self._sessions)]
+            for sid in list(self._jdb_sessions):
+                jdb = self._jdb_sessions.pop(sid)
+                _record_closed_jdb(
+                    self._closed_jdb,
+                    sid,
+                    _jdb_close_reason(jdb, "detached"),
+                    time.monotonic(),
+                )
+                sessions.append(jdb)
+            self._reservations.clear()
+        for session in sessions:
+            self._teardown_any(session)
+        if sessions:
+            logger.info("debug_sessions_closed_all", count=len(sessions))
+        return len(sessions)
+
     def _close_session(self, session_id: str, jdb_reason: str) -> bool:
         session = self._pop_any(session_id, jdb_reason)
         if session is None:
@@ -418,6 +701,7 @@ class DebugSessionManager:
     def add_jdb_session(self, session: Any) -> None:
         """Register an armed jdb session until it is collected, detached or reaped."""
         with self._lock:
+            self._drop_reservation_locked(session.session_id)
             self._jdb_sessions[session.session_id] = session
 
     def take_jdb_session(self, session_id: str) -> Any:
@@ -440,6 +724,15 @@ class DebugSessionManager:
             entry = self._closed_jdb.get(session_id)
             return entry[0] if entry is not None else None
 
+    def attaching_retry_in_s(self, session_id: str) -> int | None:
+        """Return seconds left on an in-flight attach reservation for *session_id*, or None."""
+        now = time.monotonic()
+        with self._lock:
+            for res in self._reservations.values():
+                if res.session_id == session_id:
+                    return _reservation_remaining(res, now)
+        return None
+
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all active sessions.
 
@@ -451,9 +744,10 @@ class DebugSessionManager:
     def _summaries(self) -> list[dict[str, Any]]:
         now = time.monotonic()
         with self._lock:
+            attaching = [_reservation_summary(r, now) for r in self._reservations.values()]
             dap = [s.to_summary() for s in self._sessions.values()]
             jdb = [_jdb_summary(s, now) for s in self._jdb_sessions.values()]
-        return dap + jdb
+        return attaching + dap + jdb
 
     def _teardown_session(self, session: DebugSession) -> None:
         """Clean up a session — disconnect DAP, remove port forwards."""

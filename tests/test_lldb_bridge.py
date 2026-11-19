@@ -88,9 +88,13 @@ class TestLLDBAttach:
         client = bridge.attach("com.lincmobile.level", udid="AAA-BBB", project_root="/project")
 
         assert client is not None
+        assert client._cwd == "/project"
+        assert client._adapter_cmd == ["/usr/bin/lldb-dap"]
+        mock_start.assert_called_once_with()
         mock_initialize.assert_called_once_with("lldb")
+        mock_wait_event.assert_called_once_with("initialized", timeout=10)
         mock_attach.assert_called_once_with({"pid": 1234})
-        mock_config_done.assert_called_once()
+        mock_config_done.assert_called_once_with()
 
     @patch("linc_spectra.core.lldb_bridge.ios_get_app_pid", return_value=1234)
     @patch.object(DAPClient, "start")
@@ -109,10 +113,10 @@ class TestLLDBAttach:
 
         bridge = LLDBBridge(lldb_dap_path="/usr/bin/lldb-dap")
 
-        with pytest.raises(DAPError, match="initialized"):
+        with pytest.raises(DAPError, match="lldb-dap did not send 'initialized' event"):
             bridge.attach("com.lincmobile.level", udid="AAA-BBB")
 
-        mock_stop.assert_called_once()
+        mock_stop.assert_called_once_with()
 
 
 class TestLLDBBridgeNoCrucible:

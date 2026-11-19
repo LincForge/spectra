@@ -140,12 +140,13 @@ def test_security_names_the_real_sink_for_each_validated_identifier() -> None:
     assert "working directory" in security
 
 
-def test_changelog_headings_start_with_unreleased_and_0_1_0() -> None:
-    """Verify CHANGELOG.md headings start with Unreleased and 0.1.0."""
+def test_changelog_headings_are_unreleased_then_releases_newest_first() -> None:
+    """Verify CHANGELOG.md headings: Unreleased, then 0.2.0, then 0.1.0, each once."""
     changelog = (REPO / "CHANGELOG.md").read_text()
     headings = re.findall(r"^## \[(.+?)\].*$", changelog, re.M)
-    assert headings[:2] == ["Unreleased", "0.1.0"]
-    assert headings.count("0.1.0") == 1
+    assert headings[:3] == ["Unreleased", "0.2.0", "0.1.0"]
+    for version in ("Unreleased", "0.2.0", "0.1.0"):
+        assert headings.count(version) == 1
 
 
 def test_readme_states_mirror_model_trust_stance_and_cta() -> None:

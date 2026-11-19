@@ -20,17 +20,20 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
 
 from linc_spectra.core.observability import linc_home
 from linc_spectra.core.paths import redact_home
+from linc_spectra.core.validation import InvalidInputError
 
 # Tool/server names that only ever appear from test fixtures — never real
 # traffic. Used to quarantine junk records (see imp 01606251: the observability
 # test suite leaked these into the prod log when LINC_HOME wasn't isolated).
 _JUNK_TOOL_SUBSTRINGS = ("dummy", "fake", "magicmock", "_bad")
+_MAX_SINCE_HOURS = 87600.0
 
 
 def _default_log_path() -> Path:
@@ -38,14 +41,44 @@ def _default_log_path() -> Path:
     return linc_home() / "mcp-calls.jsonl"
 
 
-def _is_junk(rec: dict) -> bool:
-    """A record is junk if it has no server, or names a test-fixture tool."""
+def _validate_since_hours(since_hours: float | None) -> float | None:
+    """Validate *since_hours* (None or a finite number in 0..87600; 0 means all history)."""
+    if since_hours is None:
+        return None
+    if (
+        isinstance(since_hours, bool)
+        or not isinstance(since_hours, int | float)
+        or not (0.0 <= since_hours <= _MAX_SINCE_HOURS)
+    ):
+        raise InvalidInputError(
+            f"invalid since_hours {since_hours!r}: expected a finite number in 0..87600"
+        )
+    return float(since_hours) or None
+
+
+def _is_junk(rec: Any) -> bool:
+    """A record is junk if it is not a dict, has no str server/tool, or names a fixture tool."""
+    if not isinstance(rec, dict):
+        return True
     server = rec.get("server")
     tool = rec.get("tool")
-    if not server or not tool:
+    if not isinstance(server, str) or not isinstance(tool, str) or not server or not tool:
         return True
-    low = str(tool).lower()
+    low = tool.lower()
     return any(sub in low for sub in _JUNK_TOOL_SUBSTRINGS)
+
+
+def _is_finite_duration(val: Any) -> bool:
+    """Return True if *val* is a finite number (int or float, excluding bool).
+
+    An int too large for a float (a hostile log line can carry one) is not finite.
+    """
+    if isinstance(val, bool) or not isinstance(val, int | float):
+        return False
+    try:
+        return math.isfinite(val)
+    except OverflowError:
+        return False
 
 
 def _percentile(sorted_vals: list[float], pct: float) -> float:
@@ -68,14 +101,17 @@ def _iter_records(log_path: Path, include_rotated: bool) -> list[dict]:
     records: list[dict] = []
     for p in paths:
         try:
-            with p.open() as f:
+            # errors="replace": one undecodable byte (a write cut mid-character)
+            # must not hide every other record in the shared log.
+            with p.open(encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         records.append(json.loads(line))
-                    except json.JSONDecodeError:
+                    except (ValueError, RecursionError):
+                        # JSONDecodeError, the int-digit limit, absurd nesting: a junk line.
                         continue
         except OSError:
             continue
@@ -107,6 +143,7 @@ def compute_usage_stats(
         success_pct, p50/p95/avg latency, last_seen), ``dormant``, and a
         ``junk`` breakdown.
     """
+    since_hours = _validate_since_hours(since_hours)
     if log_path is None:
         log_path = _default_log_path()
     records = _iter_records(log_path, include_rotated)
@@ -127,7 +164,10 @@ def compute_usage_stats(
     window_max: str | None = None
 
     for rec in records:
-        ts = rec.get("timestamp") or ""
+        if not isinstance(rec, dict):
+            rec = {}
+        raw_ts = rec.get("timestamp")
+        ts = raw_ts if isinstance(raw_ts, str) else ""
         if cutoff_iso and ts and ts < cutoff_iso:
             continue
         if _is_junk(rec):
@@ -150,7 +190,7 @@ def compute_usage_stats(
         entry["total"] += 1
         entry["ok"] += 1 if ok else 0
         dur = rec.get("duration_ms")
-        if isinstance(dur, (int, float)):
+        if _is_finite_duration(dur):
             entry["durations"].append(float(dur))
         if ts > entry["last_seen"]:
             entry["last_seen"] = ts

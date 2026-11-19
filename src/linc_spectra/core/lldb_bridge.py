@@ -10,7 +10,7 @@ import contextlib
 
 import structlog
 
-from .dap_client import DAPClient, DAPError
+from .dap_client import DAP_INITIALIZE_TIMEOUT_SECONDS, DAPClient, DAPError
 from .ios_subprocess import ios_get_app_pid
 from .toolchain import find_lldb_dap
 
@@ -96,7 +96,9 @@ class LLDBBridge:
             client.initialize("lldb")
 
             # Wait for initialized event
-            init_event = client.wait_for_event("initialized", timeout=10)
+            init_event = client.wait_for_event(
+                "initialized", timeout=DAP_INITIALIZE_TIMEOUT_SECONDS
+            )
             if not init_event:
                 raise DAPError("lldb-dap did not send 'initialized' event")
 

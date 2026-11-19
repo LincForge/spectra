@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
+import select
 import subprocess
 import threading
 import time
@@ -35,9 +37,13 @@ from typing import Any
 
 import structlog
 
+from .paths import sanitize_diagnostic_lines, without_jvm_opt_env
+
 logger = structlog.get_logger()
 
 DEFAULT_STACK_LEVELS = 20
+DAP_INITIALIZE_TIMEOUT_SECONDS = 10
+DAP_ATTACH_TIMEOUT_SECONDS = 30
 
 # Per-event-type cap on unconsumed async events. A long session emits
 # thousands of thread/module/breakpoint events nobody waits for; the oldest
@@ -52,11 +58,23 @@ OUTPUT_BUFFER_LINES = 20
 STDERR_TAIL_LINES = 50
 STDERR_REPORT_LINES = 20
 STDERR_LINE_MAX_CHARS = 500
+STDERR_DRAIN_TIMEOUT = 0.25
+STDERR_QUIET_WINDOW = 0.015
+STDERR_POLL_INTERVAL = 0.001
 
 # Largest single stderr read: a UTF-8 character is at most 4 bytes, so one
 # read always holds a full STDERR_LINE_MAX_CHARS head, while a stream with no
 # newline is consumed in pieces instead of being buffered whole.
 STDERR_READ_LIMIT_BYTES = 4 * STDERR_LINE_MAX_CHARS
+
+# Cap on sanitized DAP error response text (message / body.error.format)
+# before it enters DAPError, tool replies, and the MCP usage log.
+DAP_ERROR_MAX_CHARS = 500
+# Raw characters of one error string (format, variable or message) scanned before
+# sanitizing; generous so stripping escapes still leaves the cap's worth of text.
+_RAW_ERROR_SCAN_CHARS = 16 * DAP_ERROR_MAX_CHARS
+_TRUNCATED_MARKER = " \u2026[truncated]"
+_DAP_VAR_RE = re.compile(r"\{([^{}]+)\}")
 
 # Framing bounds on adapter stdout. A header line longer than
 # MAX_HEADER_LINE_BYTES (terminator included) or a Content-Length outside
@@ -153,6 +171,15 @@ def _stderr_lines(stream: Any) -> Iterator[str]:
         at_line_start = piece.endswith(b"\n")
 
 
+def _stderr_readable(stream: Any) -> bool | None:
+    """True if *stream* has unread bytes, False if empty, None if not selectable."""
+    try:
+        readable, _, _ = select.select([stream], [], [], 0)
+        return bool(readable)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
 def _admits_event_type(name: str, known: dict[str, Any]) -> bool:
     """May an event name with no queue yet get one in the *known* store?"""
     return name in STANDARD_DAP_EVENTS or len(known.keys() - STANDARD_DAP_EVENTS) < (
@@ -169,6 +196,66 @@ def _exit_reason(name: str, message: dict[str, Any]) -> str:
 def _any_event(_event: dict[str, Any]) -> bool:
     """Default ``wait_for_event`` filter: accept everything."""
     return True
+
+
+def _sanitize_error_text(value: Any) -> str:
+    """Sanitize raw error text into a single control-free, home-redacted string.
+
+    Only the first ``_RAW_ERROR_SCAN_CHARS`` of the raw text are looked at: the
+    result is capped at ``DAP_ERROR_MAX_CHARS`` anyway, and a hostile adapter can
+    send megabytes.
+    """
+    if value is None:
+        return ""
+    return " ".join(sanitize_diagnostic_lines([str(value)[:_RAW_ERROR_SCAN_CHARS]]))
+
+
+def _cap_error_text(text: str) -> str:
+    """Cap error text at ``DAP_ERROR_MAX_CHARS`` with a truncation marker."""
+    if len(text) <= DAP_ERROR_MAX_CHARS:
+        return text
+    return text[: DAP_ERROR_MAX_CHARS - len(_TRUNCATED_MARKER)] + _TRUNCATED_MARKER
+
+
+def _format_error_detail(error_detail: dict[str, Any]) -> str:
+    """Sanitize and interpolate DAP ``body.error`` (``format`` + ``variables``)."""
+    fmt = _sanitize_error_text(error_detail.get("format"))
+    if not fmt:
+        return ""
+    variables = error_detail.get("variables")
+    if not isinstance(variables, dict):
+        return fmt
+
+    # Substitute against a running length budget: a format that repeats a large
+    # variable thousands of times must not be expanded past the cap first.
+    pieces: list[str] = []
+    length = 0
+    pos = 0
+    for match in _DAP_VAR_RE.finditer(fmt):
+        key = match.group(1)
+        sub = _sanitize_error_text(variables[key]) if key in variables else match.group(0)
+        for piece in (fmt[pos : match.start()], sub):
+            pieces.append(piece)
+            length += len(piece)
+        pos = match.end()
+        if length > DAP_ERROR_MAX_CHARS:
+            break
+    else:
+        pieces.append(fmt[pos:])
+    return _sanitize_error_text("".join(pieces))
+
+
+def _dap_error_message(response: dict[str, Any]) -> str:
+    """Extract, sanitize, and cap the error text from a failed DAP response."""
+    body = response.get("body")
+    if isinstance(body, dict):
+        error_detail = body.get("error")
+        if isinstance(error_detail, dict):
+            detail = _format_error_detail(error_detail)
+            if detail:
+                return _cap_error_text(detail)
+    message = _sanitize_error_text(response.get("message"))
+    return _cap_error_text(message or "Unknown error")
 
 
 def _predicates(
@@ -233,6 +320,8 @@ class DAPClient:
         event_callback: Optional callback for async events.
     """
 
+    _stderr_last_append: float = 0.0
+
     def __init__(
         self,
         adapter_cmd: list[str],
@@ -282,6 +371,7 @@ class DAPClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=self._cwd,
+            env=without_jvm_opt_env(),
         )
         self._running = True
 
@@ -363,8 +453,9 @@ class DAPClient:
             return
         with contextlib.suppress(ValueError, OSError):
             for line in _stderr_lines(stream):
-                if line:
-                    with self._stderr_lock:
+                with self._stderr_lock:
+                    self._stderr_last_append = time.monotonic()
+                    if line:
                         self._stderr_tail.append(line)
 
     def stderr_tail(self) -> list[str]:
@@ -372,16 +463,53 @@ class DAPClient:
         with self._stderr_lock:
             return list(self._stderr_tail)
 
+    def _adapter_or_reader_ended(self) -> bool:
+        """True if the adapter process has exited or the stdout reader thread has ended."""
+        if self._process is not None and self._process.poll() is not None:
+            return True
+        return self._reader_thread is not None and not self._reader_thread.is_alive()
+
+    def _wait_for_stderr_drain(self, thread: threading.Thread) -> None:
+        """Wait up to STDERR_DRAIN_TIMEOUT for unread adapter stderr."""
+        if not thread.is_alive():
+            return
+        stream = getattr(self._process, "stderr", None)
+        if self._adapter_or_reader_ended() or _stderr_readable(stream) is None:
+            thread.join(STDERR_DRAIN_TIMEOUT)
+            return
+        self._poll_live_stderr(thread, stream)
+
+    def _poll_live_stderr(self, thread: threading.Thread, stream: Any) -> None:
+        """Poll *stream* and recent drain appends on a live adapter up to STDERR_DRAIN_TIMEOUT."""
+        deadline = time.monotonic() + STDERR_DRAIN_TIMEOUT
+        quiet_since = time.monotonic()
+        while time.monotonic() < deadline:
+            if not thread.is_alive():
+                return
+            if _stderr_readable(stream):
+                quiet_since = time.monotonic()
+            if (
+                time.monotonic() - max(quiet_since, self._stderr_last_append)
+                >= STDERR_QUIET_WINDOW
+            ):
+                return
+            time.sleep(STDERR_POLL_INTERVAL)
+
     def _diagnostics(self) -> str:
-        """Recent adapter output + stderr, formatted for an error message.
+        """Recent adapter output + stderr, sanitized and formatted for an error message.
 
         The output-event buffer is consumed (as before); the stderr tail is
         kept, since it describes the adapter rather than one request.
         """
         with self._output_buffer_lock:
-            output = list(self._output_buffer)
+            raw_output = list(self._output_buffer)
             self._output_buffer.clear()
-        stderr = self.stderr_tail()[-STDERR_REPORT_LINES:]
+        if self._stderr_thread is not None:
+            self._wait_for_stderr_drain(self._stderr_thread)
+        output = [ln[:STDERR_LINE_MAX_CHARS] for ln in sanitize_diagnostic_lines(raw_output)]
+        stderr = [
+            ln[:STDERR_LINE_MAX_CHARS] for ln in sanitize_diagnostic_lines(self.stderr_tail())
+        ][-STDERR_REPORT_LINES:]
         sections = [("adapter output", output), ("adapter stderr", stderr)]
         return "".join(
             f"\n--- {title} ---\n" + "\n".join(lines) for title, lines in sections if lines
@@ -445,13 +573,9 @@ class DAPClient:
             response = self._responses.pop(seq, {})
 
         if not response.get("success", True):
-            error_msg = response.get("message", "Unknown error")
-            body = response.get("body", {})
-            if isinstance(body, dict):
-                error_detail = body.get("error", {})
-                if isinstance(error_detail, dict) and error_detail.get("format"):
-                    error_msg = error_detail["format"]
-            raise DAPError(f"DAP error on '{command}': {error_msg}{self._diagnostics()}")
+            raise DAPError(
+                f"DAP error on '{command}': {_dap_error_message(response)}{self._diagnostics()}"
+            )
 
         return response
 
@@ -781,6 +905,7 @@ class DAPClient:
                 "supportsVariablePaging": False,
                 "supportsRunInTerminalRequest": False,
             },
+            timeout=DAP_INITIALIZE_TIMEOUT_SECONDS,
         )
 
     def attach(self, config: dict[str, Any]) -> dict[str, Any]:
@@ -792,7 +917,7 @@ class DAPClient:
         Returns:
             Attach response.
         """
-        return self._send_request("attach", config, timeout=30)
+        return self._send_request("attach", config, timeout=DAP_ATTACH_TIMEOUT_SECONDS)
 
     def set_breakpoints(self, path: str, lines: list[int]) -> dict[str, Any]:
         """Set breakpoints in a source file.

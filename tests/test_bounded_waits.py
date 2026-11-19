@@ -146,8 +146,8 @@ def _arm_method(mgr: DebugSessionManager, **kw: Any) -> tuple[str, FakeJdbProc]:
     return sid, session._proc
 
 
-def _arm_exception(mgr: DebugSessionManager) -> tuple[str, FakeJdbProc]:
-    sid = str(arm_exception_breakpoint(PKG, EXC, serial=SERIAL, registry=mgr)["session_id"])
+def _arm_exception(mgr: DebugSessionManager, pkg: str = PKG) -> tuple[str, FakeJdbProc]:
+    sid = str(arm_exception_breakpoint(pkg, EXC, serial=SERIAL, registry=mgr)["session_id"])
     session = mgr.peek_jdb_session(sid)
     return sid, session._proc
 
@@ -196,8 +196,10 @@ class TestWaitContract:
         with patch("linc_spectra.mcp_server._get_session_manager", return_value=mgr):
             out = _bounded(lambda: asyncio.run(call()))
         assert out.error is None, out.error
-        _content, structured = out.value
-        assert "wait_s" in structured["error"]
+        result = out.value
+        assert result.is_error is False
+        assert result.content, "the tool result must carry text content"
+        assert "wait_s" in result.structured_content["error"]
         assert session.session_id in _listed(mgr)
 
     @pytest.mark.parametrize(
@@ -464,7 +466,7 @@ class TestControlToolsNeverQueue:
     ) -> None:
         """[contract] 8 x spectra_exception_info(wait_s=1e9): sessions / detach still answer."""
         fake_jdb(_exception_script())
-        armed = [_arm_exception(mgr) for _ in range(8)]
+        armed = [_arm_exception(mgr, pkg=f"{PKG}.p{i}") for i in range(8)]
         sids = [sid for sid, _ in armed]
         sessions = [mgr.peek_jdb_session(sid) for sid in sids]
         record: dict[str, Any] = {}
@@ -481,7 +483,9 @@ class TestControlToolsNeverQueue:
             while time.monotonic() < deadline and not all(map(_is_waiting, sessions)):
                 await asyncio.sleep(0.02)
             started = time.monotonic()
-            _content, listed = await asyncio.wait_for(server.call_tool("spectra_sessions", {}), 2)
+            listed = (
+                await asyncio.wait_for(server.call_tool("spectra_sessions", {}), 2)
+            ).structured_content
             record["sessions_s"] = time.monotonic() - started
             record["listed"] = {row["session_id"] for row in listed["sessions"]}
             record["detach_s"] = []
@@ -490,7 +494,7 @@ class TestControlToolsNeverQueue:
                 await asyncio.wait_for(server.call_tool("spectra_detach", {"session_id": sid}), 5)
                 record["detach_s"].append(time.monotonic() - started)
             done = await asyncio.wait_for(asyncio.gather(*waits), 2)
-            record["collect_results"] = [structured for _content, structured in done]
+            record["collect_results"] = [result.structured_content for result in done]
 
         with patch("linc_spectra.mcp_server._get_session_manager", return_value=mgr):
             run = _Outcome(lambda: asyncio.run(scenario()))

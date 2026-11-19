@@ -137,11 +137,11 @@ class TestStrictToolsContract:
         """[contract] Calling a registered tool with an unknown key raises ToolError naming it."""
         import anyio
         import pytest
-        from mcp.server.fastmcp.exceptions import ToolError as FastMCPToolError
+        from linc_cli_kit import SDKToolError
 
         from linc_spectra.mcp_server import server
 
-        with pytest.raises(FastMCPToolError, match="hallucinated_flag"):
+        with pytest.raises(SDKToolError, match="hallucinated_flag"):
             anyio.run(server.call_tool, "spectra_sessions", {"hallucinated_flag": True})
 
     def test_contract_server_sets_additional_properties_false_on_all_tools(self) -> None:
@@ -153,7 +153,7 @@ class TestStrictToolsContract:
         tools = anyio.run(server.list_tools)
         assert len(tools) > 0
         for tool in tools:
-            assert tool.inputSchema.get("additionalProperties") is False, tool.name
+            assert tool.input_schema.get("additionalProperties") is False, tool.name
 
 
 class TestDeviceAliasContract:

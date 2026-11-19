@@ -9,7 +9,7 @@ Spectra manages stateful mobile debug sessions across stateless MCP calls. It pr
 ```text
 src/linc_spectra/
 ├── cli.py                 # Click CLI (spectra doctor, spectra bellows, spectra logo)
-├── mcp_server.py          # FastMCP (14 tools)
+├── mcp_server.py          # MCPServer (14 tools)
 ├── _logging.py            # stderr-only structlog configuration for stdio MCP safety
 └── core/
     ├── dap_client.py      # DAP wire protocol (Content-Length framing, request/event correlation)

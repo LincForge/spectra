@@ -1,6 +1,6 @@
 """MCP server for Linc Spectra — Claude Code integration.
 
-Exposes spectra debug tools via FastMCP for debugger attachment,
+Exposes spectra debug tools via the mcp SDK's MCPServer for debugger attachment,
 breakpoints, variable inspection, and stepping.
 
 Start with: ``spectra bellows``
@@ -19,13 +19,14 @@ Configure in ``~/.claude.json``::
 """
 
 import asyncio
+import atexit
 import contextlib
 import functools
 import os
 import re
 import threading
 import time as _time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from functools import wraps
 from typing import TYPE_CHECKING, Any
 
@@ -33,11 +34,12 @@ import anyio
 import anyio.to_thread
 import structlog
 from linc_cli_kit import strict_tools
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from linc_spectra import __version__
 from linc_spectra.core.observability import log_mcp_call
-from linc_spectra.core.validation import validate_app_id, validate_device_id
+from linc_spectra.core.session_manager import TargetBusyError
+from linc_spectra.core.validation import InvalidInputError, validate_app_id, validate_device_id
 
 if TYPE_CHECKING:
     from .core.session_manager import DebugSession
@@ -45,11 +47,6 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 # --- Module-level singletons (initialized on first tool call) ---
-
-server = FastMCP("linc-spectra")
-# FastMCP has no version argument and its low-level Server falls back to the
-# mcp SDK package's version in initialize's serverInfo; stamp linc-spectra's.
-server._mcp_server.version = __version__
 
 # Short poll used by spectra_breakpoint to capture an already-present first
 # stopped event without adding latency to the common not-yet-stopped path.
@@ -78,6 +75,43 @@ def _get_session_manager():
 
             _session_manager = DebugSessionManager()
         return _session_manager
+
+
+_default_get_session_manager = _get_session_manager
+
+
+def _shutdown_sessions() -> None:
+    """Detach every live DAP and jdb session on server shutdown or process exit."""
+    managers: list[Any] = []
+    with _session_manager_lock:
+        if _session_manager is not None:
+            managers.append(_session_manager)
+    if _get_session_manager is not _default_get_session_manager:
+        patched_sm = _get_session_manager()
+        if patched_sm is not None and all(patched_sm is not m for m in managers):
+            managers.append(patched_sm)
+    for sm in managers:
+        try:
+            sm.close_all()
+        except Exception as exc:
+            logger.warning("session_shutdown_error", error=str(exc))
+
+
+@contextlib.asynccontextmanager
+async def _server_lifespan(_app: MCPServer[Any]) -> AsyncIterator[None]:
+    """Ensure every live debug session is detached when the MCP server shuts down."""
+    try:
+        yield
+    finally:
+        with anyio.CancelScope(shield=True):
+            await anyio.to_thread.run_sync(_shutdown_sessions)
+
+
+atexit.register(_shutdown_sessions)
+
+# The version is what initialize reports as serverInfo.version; without it the
+# low-level Server would report the mcp SDK package's version instead.
+server = MCPServer("linc-spectra", version=__version__, lifespan=_server_lifespan)
 
 
 _LINE_TOKEN_RE = re.compile(r"[1-9][0-9]{0,6}")
@@ -341,6 +375,8 @@ def _attach_session(device_serial: str, package: str, platform: str) -> dict[str
             "device_serial": session.device_serial,
             "package": session.package,
         }
+    except TargetBusyError as e:
+        return e.to_error_dict()
     except Exception as e:
         return {"error": f"Failed to attach: {e}"}
 
@@ -370,7 +406,10 @@ def spectra_attach(
     TIP: Get device_serial from `adb devices` (Android) or a simulator UDID /
         `booted` (iOS). After attaching, use spectra_breakpoint to set
         breakpoints, then spectra_variables to inspect state when stopped.
-        Always spectra_detach when done. spectra_breakpoint needs the app's
+        Always spectra_detach when done. One debugger per process is enforced per spectra server process:
+        attaching while a DAP or jdb session already holds the app fails at
+        once naming that session_id (spectra_detach it first).
+        spectra_breakpoint needs the app's
         REAL source files checked out locally — without them, skip this and
         use spectra_method_breakpoint (zero-config, method name only) to read
         runtime state that is not visible in the UI or logs. Requires a
@@ -508,8 +547,10 @@ def spectra_method_breakpoint(
         capture_budget_s, so it never sits suspended (no tap timeout, no ANR);
         the session is then listed as "captured" until collected. Pass
         auto_capture=False to keep the app suspended at the hit until
-        spectra_method_locals steps it manually. Do NOT arm while a spectra_attach DAP session holds the same app —
-        one debugger per process. method_fqn is "package.Class.method"
+        spectra_method_locals steps it manually. One debugger per process is enforced
+        per spectra server process: arming while a spectra_attach DAP or jdb session
+        holds the same app fails at once naming that session_id (spectra_detach it first).
+        method_fqn is "package.Class.method"
         ("com.example.CheckoutViewModel.applyDiscount"); for an OVERLOADED
         method add jdb's argument types: "com.app.Repo.save(java.lang.String)".
         Constructors are "<init>". Names are validated (no shell/jdb metachars).
@@ -554,6 +595,8 @@ def spectra_method_breakpoint(
                 capture_budget_s=capture_budget_s,
             )
         )
+    except TargetBusyError as e:
+        return e.to_error_dict()
     except JdbError as e:
         return {"error": str(e)}
     except Exception as e:
@@ -645,8 +688,10 @@ def spectra_exception_breakpoint(
         throw) → spectra_exception_info to harvest. scope "uncaught"
         (default) fires
         only on crashing throws; "caught" / "all" also stop on handled ones
-        (noisy — prefer a narrow exception_class then). One debugger per
-        process: don't arm while a DAP session is attached to the same app.
+        (noisy — prefer a narrow exception_class then). One debugger per process is enforced
+        per spectra server process: arming while a DAP or jdb session is attached to
+        the same app fails at once naming that session_id (spectra_detach it
+        first).
         Armed sessions show in spectra_sessions, close via spectra_detach, and
         auto-close (app resumed) after 180 s uncollected.
 
@@ -679,6 +724,8 @@ def spectra_exception_breakpoint(
                 registry=_get_session_manager(),
             )
         )
+    except TargetBusyError as e:
+        return e.to_error_dict()
     except JdbError as e:
         return {"error": str(e)}
     except Exception as e:
@@ -1075,14 +1122,26 @@ def _already_detached_response(session_id: str, reason: str) -> dict[str, Any]:
     }
 
 
+def _attaching_detach_response(session_id: str, retry_in_s: int) -> dict[str, Any]:
+    return {
+        "detached": False,
+        "session_id": session_id,
+        "state": "attaching",
+        "retry_in_s": retry_in_s,
+    }
+
+
 def _detach_session(sm: Any, session_id: str) -> dict[str, Any]:
-    """Detach a live session, or report already_detached for a recently closed jdb session."""
+    """Detach a live session, or report attaching / already_detached status."""
     removed = sm.remove_session(session_id)
     reason = sm.closed_jdb_reason(session_id)
     if removed and reason != "auto_captured":
         return {"session_id": session_id, "status": "detached"}
     if isinstance(reason, str):
         return _already_detached_response(session_id, reason)
+    retry_in_s = sm.attaching_retry_in_s(session_id)
+    if isinstance(retry_in_s, int):
+        return _attaching_detach_response(session_id, retry_in_s)
     return {"error": f"Session '{session_id}' not found."}
 
 
@@ -1182,13 +1241,16 @@ def spectra_usage_stats(
     from linc_spectra.core.usage_stats import compute_usage_stats
 
     registered = [t.name for t in server._tool_manager.list_tools()]
-    return compute_usage_stats(
-        server=server_filter or None,
-        registered_tools=registered,
-        since_hours=since_hours or None,
-        include_rotated=include_rotated,
-        top_n=top_n,
-    )
+    try:
+        return compute_usage_stats(
+            server=server_filter or None,
+            registered_tools=registered,
+            since_hours=since_hours,
+            include_rotated=include_rotated,
+            top_n=top_n,
+        )
+    except InvalidInputError as e:
+        return {"error": str(e), "validation_error": True}
 
 
 # --- Registration: every tool runs off the event loop (linc-spectra#45) ---
@@ -1199,11 +1261,16 @@ def _offloaded(
 ) -> Callable[..., Any]:
     """Async twin of a blocking tool body, run in a worker thread under *limiter*.
 
-    FastMCP executes a plain ``def`` tool inline on the event loop, so one
-    30 s ``spectra_continue`` froze every other call (sessions, detach,
-    pings). ``functools.wraps`` keeps the name, docstring and signature the
-    tool schema is built from. The module-level function stays sync so it
-    can still be called directly.
+    mcp 1.x ran a plain ``def`` tool inline on the event loop, so one 30 s
+    ``spectra_continue`` froze every other call (sessions, detach, pings).
+    mcp 2.x offloads a plain ``def`` itself, but onto anyio's single default
+    thread limiter, where a full lane of blocked ``spectra_continue`` waits
+    would queue the ``spectra_detach`` / ``spectra_sessions`` call that ends
+    them. This wrapper keeps spectra's own two lanes (``_TOOL_LIMITER`` and
+    ``_CONTROL_LIMITER``); because it is a coroutine function, the SDK awaits
+    it directly and does not offload it a second time. ``functools.wraps``
+    keeps the name, docstring and signature the tool schema is built from.
+    The module-level function stays sync so it can still be called directly.
     """
 
     @functools.wraps(fn)

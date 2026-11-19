@@ -37,12 +37,12 @@ EXPECTED_TOOLS: list[str] = [
 
 _INLINE_MARKER_RE = re.compile(r"<!-- SPECTRA:TOOL-COUNT -->(\d+)<!-- /SPECTRA:TOOL-COUNT -->")
 _HEADING_RE = re.compile(r"^## MCP Tools \((\d+)\)", re.MULTILINE)
-_ARCH_COUNT_RE = re.compile(r"FastMCP \((\d+) tools\)")
+_ARCH_COUNT_RE = re.compile(r"MCPServer \((\d+) tools\)")
 _TABLE_ROW_RE = re.compile(r"^\|\s*`(spectra_[a-z0-9_]+)`\s*\|", re.MULTILINE)
 
 
 def _live_tool_names() -> list[str]:
-    """Return the sorted names of tools registered on the live FastMCP server."""
+    """Return the sorted names of tools registered on the live MCPServer."""
     live = asyncio.run(server.list_tools())
     return sorted(tool.name for tool in live)
 
@@ -63,7 +63,7 @@ def _assert_docs_match_live(root: pathlib.Path, live_names: list[str]) -> None:
     heading_count = int(heading_matches[0])
 
     arch_matches = _ARCH_COUNT_RE.findall(architecture)
-    assert arch_matches, "ARCHITECTURE.md missing 'FastMCP (N tools)' count"
+    assert arch_matches, "ARCHITECTURE.md missing 'MCPServer (N tools)' count"
     arch_count = int(arch_matches[0])
 
     live_count = len(live_names)

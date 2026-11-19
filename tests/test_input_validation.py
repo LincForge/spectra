@@ -596,7 +596,7 @@ class TestLinesAndDapBounds:
 class TestStrictToolArgumentTypes:
     def test_call_tool_rejects_coerced_bool_and_int_strings(self) -> None:
         import anyio
-        from mcp.server.fastmcp.exceptions import ToolError
+        from linc_cli_kit import SDKToolError as ToolError
 
         from linc_spectra.mcp_server import server
 
@@ -632,7 +632,7 @@ class TestStrictToolArgumentTypes:
                         "capture_steps": "4x",
                     },
                 )
-            # FastMCP's FuncMetadata.pre_parse_json skips int/float scalars, so
+            # The SDK's FuncMetadata.pre_parse_json skips int/float scalars, so
             # string "7" reaches Pydantic with strict=True and is rejected.
             with pytest.raises(ToolError):
                 anyio.run(

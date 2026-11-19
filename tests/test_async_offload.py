@@ -1,15 +1,19 @@
 """Tools run off the MCP event loop (linc-spectra#45).
 
-Every spectra tool was a plain ``def``; FastMCP runs those inline on the
+Every spectra tool body is a plain ``def``. mcp 1.x ran those inline on the
 event loop, so a 30 s ``spectra_continue`` froze the whole server:
 ``spectra_sessions``, another session's ``spectra_detach`` and MCP pings all
-waited behind it. Registered tools now await ``anyio.to_thread.run_sync``
-under a CapacityLimiter. No real debugger or device is involved.
+waited behind it. mcp 2.x offloads a plain ``def`` itself, but onto anyio's
+single default thread limiter, so a full lane of blocked waits would still
+queue the detach that ends them. Registered tools therefore stay async
+wrappers that await ``anyio.to_thread.run_sync`` under spectra's own two
+CapacityLimiters (tools and control). No real debugger or device is involved.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
 import time
 from typing import Any
@@ -28,6 +32,24 @@ class TestRegistration:
         tools = _registered_tools()
         assert len(tools) == 14
         assert all(t.is_async for t in tools), [t.name for t in tools if not t.is_async]
+
+    def test_contract_every_tool_is_spectras_own_lane_wrapper(self) -> None:
+        """[contract] pin: each registered fn is ``_offloaded``'s coroutine wrapper around
+        the module function, bound to that tool's spectra limiter. mcp 2.x awaits a
+        coroutine function as is; a raw ``def`` would instead go to anyio's single
+        shared thread limiter and lose the control lane."""
+        tools = _registered_tools()
+        control: set[str] = set()
+        for tool in tools:
+            body = getattr(mcp_server, tool.name)
+            assert tool.fn.__code__.co_qualname == "_offloaded.<locals>.run_in_thread", tool.name
+            assert tool.fn.__wrapped__ is body, tool.name
+            assert inspect.iscoroutinefunction(tool.fn), tool.name
+            limiter = inspect.getclosurevars(tool.fn).nonlocals["limiter"]
+            assert limiter is mcp_server._limiter_for(body), tool.name
+            if limiter is mcp_server._CONTROL_LIMITER:
+                control.add(tool.name)
+        assert control == {"spectra_detach", "spectra_sessions", "spectra_usage_stats"}
 
     def test_schemas_still_come_from_the_tool_signatures(self) -> None:
         tool = next(t for t in _registered_tools() if t.name == "spectra_attach")
@@ -133,7 +155,7 @@ class TestSingletonInitIsThreadSafe:
 class TestPerSessionSerialization:
     """Parallel worker threads must not interleave calls on ONE session.
 
-    Before offloading, FastMCP ran tools one at a time; a retried
+    Before offloading, mcp 1.x ran tools one at a time; a retried
     spectra_continue racing another could wipe the stop the first recorded.
     """
 

@@ -1,6 +1,6 @@
 [project]
 name = "linc-spectra"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI-driven mobile debugging — spectral analysis of running apps"
 readme = "README.md"
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ dependencies = [
     "pyyaml>=6.0",
     "click>=8.1.7",
     "rich>=13.7.0",
-    "mcp>=1.0.0",
+    "mcp>=2.3.0,<3",
     "python-dateutil>=2.8.2",
     "structlog>=25.0",
     "linc-cli-kit>=0.1.4",
@@ -38,6 +38,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "pytest-asyncio>=0.24",
+    "hypothesis>=6.100",
     "ruff>=0.9",
     "bandit>=1.7",
     "mutmut>=3.5,<4",

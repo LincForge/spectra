@@ -1,0 +1,12 @@
+java.io.IOException: handshake failed - connection prematurally closed
+	at jdk.jdi/com.sun.tools.jdi.SocketTransportService.handshake(SocketTransportService.java:137)
+	at jdk.jdi/com.sun.tools.jdi.SocketTransportService.attach(SocketTransportService.java:271)
+	at jdk.jdi/com.sun.tools.jdi.GenericAttachingConnector.attach(GenericAttachingConnector.java:119)
+	at jdk.jdi/com.sun.tools.jdi.SocketAttachingConnector.attach(SocketAttachingConnector.java:83)
+	at jdk.jdi/com.sun.tools.example.debug.tty.VMConnection.attachTarget(VMConnection.java:557)
+	at jdk.jdi/com.sun.tools.example.debug.tty.VMConnection.open(VMConnection.java:367)
+	at jdk.jdi/com.sun.tools.example.debug.tty.Env.init(Env.java:63)
+	at jdk.jdi/com.sun.tools.example.debug.tty.TTY.main(TTY.java:1113)
+
+Fatal error:
+Unable to attach to target VM.

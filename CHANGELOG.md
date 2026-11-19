@@ -5,6 +5,38 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-19
+
+### Changed
+- Requires the `mcp` Python SDK `>=2.3.0,<3` (was `>=1.30.0,<2`). The server is now `mcp.server.mcpserver.MCPServer` with linc-spectra's version passed to the constructor, so `initialize` still reports it as `serverInfo.version`. Tool names, arguments and results are unchanged: unknown or type-coerced arguments are still rejected, and every tool still runs on linc-spectra's own two thread lanes, so `spectra_detach` and `spectra_sessions` answer while long waits are blocked.
+- **Behavior change:** one debugger per target is now enforced inside a spectra server (#95). `spectra_attach`, `spectra_method_breakpoint` and `spectra_exception_breakpoint` reserve the app on its device before starting `adb forward`, `jdb` or a debug adapter, and fail fast with `TargetBusyError` when a DAP or `jdb` session already holds it: the tool returns `{"error": "<package> on <serial> already has debugger session <id> (<kind>); spectra_detach it first", "validation_error": false, "session_id": <id>}` instead of starting a second debugger. A `jdb` arm with no serial conflicts with any session on the same package. The reservation is released on every failure path and on detach, collect and reap. Other spectra servers and other debuggers are not coordinated.
+- Requires `linc-cli-kit>=0.3.1` (was `>=0.1.4`, which cannot be installed together with `mcp>=2.3`).
+- **Behavior change:** when `adb` itself fails (for example no device, or the device is not found), tools report `adb failed (exit code N): <adb's error>` instead of "`<package>` is not running" or "Cannot find debuggable PID" (#107). Callers matching the old strings need updating.
+- **Behavior change:** `spectra_detach` on the session id of an attach that is still in progress returns `{"detached": false, "session_id": <id>, "state": "attaching", "retry_in_s": <seconds>}` instead of "not found" (#104).
+
+### Fixed
+- When `jdb` exits before attaching, `JdbError` now reports the exit code and a bounded `jdb` output tail (its first `Exception` / `Error:` cause line, then the last 5 non-blank lines, at most 500 characters), naming another JDWP debugger whenever the output shows a handshake failure, instead of claiming `jdb did not attach in Ns`. The tail is sanitized: ANSI escape sequences and control characters are stripped, `Picked up JAVA_TOOL_OPTIONS:` / `_JAVA_OPTIONS:` / `JDK_JAVA_OPTIONS:` banner lines are dropped, and the home directory is shown as `~`. Nothing else in the output is redacted.
+- DAP errors raised right after the adapter wrote `stderr` and exited now carry that `stderr` in their tail: the error waits up to 250 ms for the `stderr` drain instead of racing it (#90). A live adapter with no unread `stderr` no longer pays that wait, and returns as soon as `stderr` is quiet (#92).
+- `jdb` waits keep at most the last 64 output lines (plus the first cause line) instead of every line, so a flood of output no longer grows memory while an attach or hit is awaited (#100).
+- `spectra_sessions` lists an attach that is still in progress as `state: "attaching"` with `expires_in_seconds`, and a second attach on that app reports that the first one is in progress and when it times out, instead of naming a session id that `spectra_detach` cannot find (#102).
+- Target aliases are normalized before the one-debugger check: iOS simulator UDIDs compare case-insensitively, `booted` resolves to the booted simulator's UDID (when it cannot be resolved it conflicts with any simulator session on the same app), and Android `localhost:<port>` / `127.0.0.1:<port>` maps to `emulator-<port - 1>` (#102).
+- `spectra_usage_stats` rejects a `since_hours` that is not a finite number in `0`–`87600` with a validation error instead of crashing (`0` still means all history), and counts log records that are not objects, or whose `server` or `tool` is not a non-empty string, as junk (#101).
+- The in-flight attach budget comes from the real phase timeouts (DAP: `initialize` + `attach`, 40 s; `jdb`: attach + breakpoint/catchpoint confirmation, 30 s) instead of a fixed 30 s, so `expires_in_seconds` no longer reads 0 for most of a still-running attach (#104).
+- `spectra_usage_stats` treats non-string timestamps as missing and skips non-finite, boolean and out-of-range durations, and a log line that cannot be decoded or parsed (invalid UTF-8, an integer past Python's digit limit, absurd nesting) is skipped instead of crashing the tool (#105, #108).
+- The `jdb` reader queue is bounded by an 8 MiB character budget as well as a line count, so very long output lines no longer grow memory (#107).
+- Live DAP and `jdb` sessions are detached when the server shuts down (stdin closed, or a normal process exit): `adb forward` entries are removed and `spectra-jdb-*` temp dirs deleted (#107).
+
+### Security
+- `jdb` is started without `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS` and `JDK_JAVA_OPTIONS` in its environment, and `jdb` and debug adapter output in attach and DAP errors (and so in the usage log) goes through the same sanitizer as the `jdb` tail above (#100).
+- Unexpected tool exceptions are logged to `stderr` as plain tracebacks without frame locals, so tool arguments are no longer printed with them (#101).
+- Debug adapter error responses (`message`, `body.error.format` and every substituted variable) go through the same sanitizer and are capped at 500 characters; substitution stops at the cap, so a hostile adapter cannot make the server expand a huge error first (#106, #108).
+- The sanitizer also strips Unicode control, format and separator characters (C1 controls, bidi overrides and isolates, zero-width characters, U+2028/U+2029), and the debug adapter, like `jdb`, is started without the JVM option variables (#106).
+
+### Known issues
+- The in-flight attach countdown does not yet include the adapter's `initialized` wait or the `adb` steps before it, so `expires_in_seconds` can read 0 for the last seconds of a slow attach. The attach itself still times out normally.
+- Session teardown runs when the client closes stdin or the process exits normally, but not on SIGTERM or SIGHUP: a server killed by a signal can leave `adb forward` entries and `spectra-jdb-*` temp dirs behind (`adb forward --remove-all` clears the forwards).
+- Stripping Unicode format characters from error text also removes zero-width joiners, so an emoji sequence or a Persian word quoted in an error message can render differently. Debuggee values returned by `spectra_variables` and `spectra_evaluate` are not affected.
+
 ## [0.1.0] - 2026-10-24
 
 First public release.

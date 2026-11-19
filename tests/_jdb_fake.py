@@ -89,6 +89,8 @@ class FakeJdbProc:
         locals_delay_s: float = 0.05,
         tail_s: float = 0.03,
         prompt: str | None = PROMPT,
+        exit_code: int | None = None,
+        exit_delay_s: float = 0.0,
     ) -> None:
         self._script = script
         self._q: queue.Queue = queue.Queue()
@@ -98,12 +100,23 @@ class FakeJdbProc:
         self.locals_delay_s = locals_delay_s
         self.tail_s = tail_s
         self.prompt = prompt
+        self.returncode: int | None = None
         self.sent: list[tuple[float, str]] = []
         self._outbox: queue.Queue = queue.Queue()
         self._stopped = threading.Event()
         threading.Thread(target=self._emitter, daemon=True).start()
         for line in banner:
             self._q.put(line)
+        if exit_code is not None:
+            if exit_delay_s > 0:
+                threading.Timer(exit_delay_s, self._exit_with, args=(exit_code,)).start()
+            else:
+                self._exit_with(exit_code)
+
+    def _exit_with(self, code: int) -> None:
+        self.returncode = code
+        self._stopped.set()
+        self._q.put(None)
 
     # stdin protocol
     def write(self, data: bytes | str) -> None:
@@ -116,6 +129,8 @@ class FakeJdbProc:
                 self._respond(cmd, list(out))
                 return
         if cmd in ("cont", "exit"):
+            if self.returncode is None:
+                self.returncode = 0
             self._stopped.set()
             self._q.put(None)
 
@@ -164,10 +179,15 @@ class FakeJdbProc:
     def close(self) -> None:
         pass
 
+    def poll(self) -> int | None:
+        return self.returncode
+
     def wait(self, timeout: float = 0) -> int:
-        return 0
+        return 0 if self.returncode is None else self.returncode
 
     def kill(self) -> None:
+        if self.returncode is None:
+            self.returncode = -9
         self._stopped.set()
         self._q.put(None)
 
@@ -180,11 +200,12 @@ def _fake_popen(script: dict[str, list[str]], banner: list[str], **knobs: Any):
 
 
 def _patched(script: dict[str, list[str]], banner: list[str] | None = None, **knobs: Any):
+    actual_banner = ["Initializing jdb ..."] if banner is None else banner
     return (
         patch.object(
             jdb_session.subprocess,
             "Popen",
-            _fake_popen(script, banner or ["Initializing jdb ..."], **knobs),
+            _fake_popen(script, actual_banner, **knobs),
         ),
         patch.object(jdb_session.shutil, "which", return_value="/opt/jdk/bin/jdb"),
         patch.object(jdb_session, "adb_get_pid", return_value=4242),

@@ -58,9 +58,11 @@ def cli() -> None:
         # Check the debugger toolchain (exit 0 when a lane is usable)
         spectra doctor
 
+    \b
         # Start the MCP server (stdio)
         spectra bellows
 
+    \b
         # Register the MCP server with Claude Code
         claude mcp add linc-spectra -- spectra bellows
     """
@@ -297,13 +299,19 @@ def _boot_health_warnings() -> list[str]:
     ]
 
 
+def _print_boot_health() -> None:
+    """Print each boot health warning on its own stderr line (nothing when healthy)."""
+    for warning in _boot_health_warnings():
+        print(warning, file=sys.stderr)
+
+
 @cli.command()
 def bellows() -> None:
     """Start the MCP server — prism refracts the spectrum."""
     # stderr only: stdout is the MCP stdio protocol channel. Logging is routed
-    # there before the server module (and FastMCP's own logging) is imported.
+    # there before the server module (and the SDK's own logging) is imported.
     configure_logging()
-    print("\n".join(_boot_health_warnings()), file=sys.stderr, end="")
+    _print_boot_health()
 
     from .mcp_server import server
 

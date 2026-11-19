@@ -32,7 +32,7 @@ def test_contract_live_tool_descriptions_are_free_of_internal_ids_and_nerve_name
 
 def test_server_initialization_options_report_linc_spectra_version() -> None:
     """[test] Low-level MCP server initialization options report linc_spectra.__version__."""
-    opts = server._mcp_server.create_initialization_options()
+    opts = server._lowlevel_server.create_initialization_options()
     assert opts.server_version == linc_spectra.__version__
 
 

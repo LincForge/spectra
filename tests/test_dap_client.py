@@ -308,12 +308,23 @@ class TestDAPCommands:
 
     def test_initialize(self) -> None:
         client = self._make_client_with_mock_send()
-        client.initialize("test-adapter")
-        client._send_request.assert_called_once()
-        args = client._send_request.call_args
-        assert args[0][0] == "initialize"
-        assert args[0][1]["adapterID"] == "test-adapter"
-        assert args[0][1]["clientID"] == "linc-spectra"
+        resp = client.initialize("test-adapter")
+        assert resp == {"type": "response", "success": True, "body": {}}
+        client._send_request.assert_called_once_with(
+            "initialize",
+            {
+                "clientID": "linc-spectra",
+                "clientName": "Linc Spectra",
+                "adapterID": "test-adapter",
+                "linesStartAt1": True,
+                "columnsStartAt1": True,
+                "pathFormat": "path",
+                "supportsVariableType": True,
+                "supportsVariablePaging": False,
+                "supportsRunInTerminalRequest": False,
+            },
+            timeout=10,
+        )
 
     def test_attach(self) -> None:
         client = self._make_client_with_mock_send()

@@ -9,12 +9,15 @@ import pytest
 
 from linc_spectra.core.adb_subprocess import (
     ADB_FORWARD_TIMEOUT_S,
+    AdbCommandError,
+    AdbError,
     AdbNotFoundError,
     _adb_cmd,
     adb_forward_jdwp,
     adb_get_pid,
     adb_list_jdwp_pids,
     adb_remove_forward,
+    sanitize_adb_stderr,
 )
 
 
@@ -273,3 +276,219 @@ class TestAdbNotFoundError:
         assert "error" in result
         assert "adb not found" in result["error"]
         assert "spectra doctor" in result["error"]
+
+
+class TestAdbNonZeroExitContract:
+    """[contract] Non-zero adb exit carries sanitized stderr instead of 'is not running'."""
+
+    def test_contract_adb_shim_exit_1_device_not_found_in_method_breakpoint(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] with an adb shim that exits 1 with 'device not found',
+        spectra_method_breakpoint reports the adb error, not 'is not running'."""
+        import sys
+
+        from linc_spectra.mcp_server import spectra_method_breakpoint
+
+        adb_shim = tmp_path / "adb"
+        adb_shim.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "sys.stderr.write('device not found\\n')\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        adb_shim.chmod(0o755)
+
+        jdb_shim = tmp_path / "jdb"
+        jdb_shim.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+        jdb_shim.chmod(0o755)
+
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setenv("SPECTRA_USAGE_LOG", "off")
+        result = spectra_method_breakpoint(
+            device_serial="DEV1",
+            package="com.example.app",
+            method_fqn="com.example.Foo.bar",
+        )
+
+        assert "error" in result
+        assert "device not found" in result["error"]
+        assert "adb" in result["error"].lower()
+        assert "is not running" not in result["error"]
+
+    def test_contract_adb_shim_exit_1_device_not_found_in_attach_and_exception(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[contract] adb shim exit 1 with 'device not found' surfaces in spectra_attach
+        and spectra_exception_breakpoint as well."""
+        import sys
+
+        from linc_spectra.core.jdwp_bridge import JDWPBridge
+        from linc_spectra.mcp_server import spectra_attach, spectra_exception_breakpoint
+
+        adb_shim = tmp_path / "adb"
+        adb_shim.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "sys.stderr.write('error: device not found\\n')\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        adb_shim.chmod(0o755)
+        jdb_shim = tmp_path / "jdb"
+        jdb_shim.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+        jdb_shim.chmod(0o755)
+
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setenv("SPECTRA_USAGE_LOG", "off")
+
+        exc_res = spectra_exception_breakpoint(device_serial="DEV1", package="com.example.app")
+        assert "device not found" in exc_res["error"]
+        assert "is not running" not in exc_res["error"]
+
+        with patch.object(JDWPBridge, "_find_adapter", return_value="/opt/kda/bin/adapter"):
+            dap_res = spectra_attach(
+                device_serial="DEV1", package="com.example.app", platform="android"
+            )
+        assert "device not found" in dap_res["error"]
+        assert "Cannot find debuggable PID" not in dap_res["error"]
+
+    @patch("linc_spectra.core.adb_subprocess.subprocess.run")
+    def test_adb_get_pid_nonzero_with_stderr_and_stdout_errors(self, mock_run: MagicMock) -> None:
+        """Non-zero exit with stderr or stdout error text raises AdbCommandError (AdbError)."""
+        mock_run.return_value = MagicMock(
+            stdout="", stderr="adb: device 'DEV1' not found\n", returncode=1
+        )
+        with pytest.raises(
+            AdbCommandError, match="adb failed \\(exit code 1\\): adb: device 'DEV1' not found"
+        ) as exc:
+            adb_get_pid("com.app", serial="DEV1")
+        assert isinstance(exc.value, AdbError)
+
+        # Fallback to stdout when stderr is empty and exit is non-zero with diagnostic text.
+        mock_run.return_value = MagicMock(
+            stdout="error: device offline\n", stderr="", returncode=1
+        )
+        with pytest.raises(
+            AdbCommandError, match="adb failed \\(exit code 1\\): error: device offline"
+        ):
+            adb_get_pid("com.app")
+
+        # Empty exit code != 1 (e.g. 2) still raises AdbCommandError even without stderr.
+        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=2)
+        with pytest.raises(AdbCommandError, match=r"^adb failed \(exit code 2\)$"):
+            adb_get_pid("com.app")
+
+    @patch("linc_spectra.core.adb_subprocess.subprocess.run")
+    def test_adb_list_jdwp_pids_nonzero_raises_adb_command_error(
+        self, mock_run: MagicMock
+    ) -> None:
+        """Sibling helper adb_list_jdwp_pids raises AdbCommandError on non-zero exit."""
+        mock_run.return_value = MagicMock(
+            stdout="", stderr="error: no devices/emulators found\n", returncode=1
+        )
+        with pytest.raises(
+            AdbCommandError,
+            match="adb failed \\(exit code 1\\): error: no devices/emulators found",
+        ):
+            adb_list_jdwp_pids(serial="DEV1")
+
+        # Empty stderr on non-zero exit still raises for adb_list_jdwp_pids (unlike pidof exit 1).
+        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=1)
+        with pytest.raises(AdbCommandError, match=r"^adb failed \(exit code 1\)$"):
+            adb_list_jdwp_pids(serial="DEV1")
+
+    def test_adb_list_jdwp_pids_failure_surfaces_in_method_breakpoint(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If pidof succeeds (0) then `adb jdwp` exits 1, error names adb, not 'NOT debuggable'."""
+        import sys
+
+        from linc_spectra.mcp_server import spectra_method_breakpoint
+
+        adb_shim = tmp_path / "adb"
+        adb_shim.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "args = sys.argv[1:]\n"
+            "if args[:1] == ['-s']:\n"
+            "    args = args[2:]\n"
+            "if args[:2] == ['shell', 'pidof']:\n"
+            "    print('4242')\n"
+            "else:\n"
+            "    sys.stderr.write('adb: device offline\\n')\n"
+            "    sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        adb_shim.chmod(0o755)
+        jdb_shim = tmp_path / "jdb"
+        jdb_shim.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+        jdb_shim.chmod(0o755)
+
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setenv("SPECTRA_USAGE_LOG", "off")
+        result = spectra_method_breakpoint(
+            device_serial="DEV1",
+            package="com.example.app",
+            method_fqn="com.example.Foo.bar",
+        )
+        assert "device offline" in result["error"]
+        assert "NOT debuggable" not in result["error"]
+
+    def test_sanitize_adb_stderr_redacts_and_bounds(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """sanitize_adb_stderr strips ANSI/control/banners, redacts HOME, and bounds output."""
+        fake_home = str(tmp_path / "users" / "alice")
+        monkeypatch.setenv("HOME", fake_home)
+
+        raw = (
+            "Picked up JAVA_TOOL_OPTIONS: -Dsecret=SECRET123\n"
+            "\x1b[31mline-0\x1b[0m\n"
+            "line-1\r\x00\n"
+            "line-2\nline-3\nline-4\nline-5\n"
+            f"line-6 at {fake_home}/tools/adb\n"
+        )
+        cleaned = sanitize_adb_stderr(raw)
+        assert "SECRET123" not in cleaned
+        assert fake_home not in cleaned
+        assert "\x1b" not in cleaned
+        assert "\r" not in cleaned
+        assert "\x00" not in cleaned
+        assert cleaned.splitlines() == [
+            "line-2",
+            "line-3",
+            "line-4",
+            "line-5",
+            "line-6 at ~/tools/adb",
+        ]
+
+        # Exact char cap (500) and line cap (5), plus bytes/None/non-str handling.
+        long_err = ("A" * 100) + ("B" * 500)
+        bounded = sanitize_adb_stderr(long_err.encode("utf-8"))
+        assert len(bounded) == 500
+        assert bounded == "B" * 500
+        assert sanitize_adb_stderr(None) == ""
+        assert sanitize_adb_stderr(MagicMock()) == ""
+
+    def test_jdb_attach_forward_called_process_error_raises_jdb_error_with_stderr(self) -> None:
+        """JdbMethodSession._attach maps CalledProcessError with sanitized stderr to JdbError."""
+        from linc_spectra.core import jdb_session
+        from linc_spectra.core.jdb_session import JdbError, JdbMethodSession
+
+        session = JdbMethodSession("com.example.app", "com.example.Foo.bar", serial="DEV1")
+        with (
+            patch.object(jdb_session.shutil, "which", return_value="/opt/jdk/bin/jdb"),
+            patch.object(jdb_session, "adb_get_pid", return_value=4242),
+            patch.object(jdb_session, "adb_list_jdwp_pids", return_value={4242}),
+            patch.object(
+                jdb_session,
+                "adb_forward_jdwp",
+                side_effect=subprocess.CalledProcessError(
+                    1, ["adb", "forward"], stderr="error: closed\n"
+                ),
+            ),
+            pytest.raises(JdbError, match="adb forward failed \\(exit code 1\\): error: closed"),
+        ):
+            session._attach(5.0)

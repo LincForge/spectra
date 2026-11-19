@@ -9,18 +9,26 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import structlog
 
 from .adb_subprocess import (
-    AdbNotFoundError,
+    AdbError,
     adb_forward_jdwp,
     adb_get_pid,
     adb_list_jdwp_pids,
     adb_remove_forward,
+    format_adb_called_process_error,
 )
-from .dap_client import DAPClient, DAPError, DAPTimeoutError
+from .dap_client import (
+    DAP_ATTACH_TIMEOUT_SECONDS,
+    DAP_INITIALIZE_TIMEOUT_SECONDS,
+    DAPClient,
+    DAPError,
+    DAPTimeoutError,
+)
 
 logger = structlog.get_logger()
 
@@ -38,13 +46,13 @@ def _home_search_paths() -> list[Path]:
 
 
 def _read_adb_pids(package: str, serial: str | None) -> tuple[int | None, set[int]]:
-    """Query package PID and JDWP PID set, mapping ``AdbNotFoundError`` to ``DAPError``."""
+    """Query package PID and JDWP PID set, mapping ``AdbError`` to ``DAPError``."""
     try:
         pid = adb_get_pid(package, serial)
         if pid is None:
             return None, set()
         return pid, adb_list_jdwp_pids(serial)
-    except AdbNotFoundError as e:
+    except AdbError as e:
         raise DAPError(str(e)) from e
 
 
@@ -163,6 +171,11 @@ class JDWPBridge:
         # Step 2: Port forward
         try:
             adb_forward_jdwp(port, pid, serial)
+        except subprocess.CalledProcessError as e:
+            msg = format_adb_called_process_error(
+                f"Failed to forward port {port} to JDWP PID {pid}", e
+            )
+            raise DAPError(msg) from e
         except Exception as e:
             raise DAPError(f"Failed to forward port {port} to JDWP PID {pid}: {e}") from e
 
@@ -219,7 +232,7 @@ class JDWPBridge:
         exc_filters = [f["filter"] for f in declared if f.get("filter") and f.get("default")]
 
         # Wait for initialized event
-        init_event = client.wait_for_event("initialized", timeout=10)
+        init_event = client.wait_for_event("initialized", timeout=DAP_INITIALIZE_TIMEOUT_SECONDS)
         if not init_event:
             raise DAPError("Adapter did not send 'initialized' event")
 
@@ -251,7 +264,7 @@ class JDWPBridge:
 
         # Wait for attach (configurationDone may not get a response
         # from kotlin-debug-adapter, so we don't block on it)
-        client._wait_for_response(attach_seq, "attach", timeout=30)
+        client._wait_for_response(attach_seq, "attach", timeout=DAP_ATTACH_TIMEOUT_SECONDS)
         # setExceptionBreakpoints and configurationDone responses are
         # best-effort — the adapter may not reply, or may reject the
         # optional request; neither may fail an otherwise-good attach.

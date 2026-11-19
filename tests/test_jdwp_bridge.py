@@ -121,12 +121,31 @@ class TestJDWPAttach:
         client = bridge.attach("com.lincmobile.level", serial="ABC", project_root="/project")
 
         assert client is not None
+        assert client._cwd == "/project"
+        assert client._adapter_cmd == ["/bin/kda"]
+        mock_start.assert_called_once_with()
         mock_forward.assert_called_once_with(5005, 1234, "ABC")
         mock_initialize.assert_called_once_with("kotlin")
+        mock_wait_event.assert_called_once_with("initialized", timeout=10)
         # attach + setExceptionBreakpoints + configurationDone fired
         assert mock_fire.call_count == 3
-        # attach response waited on
+        mock_fire.assert_any_call(
+            "attach",
+            {
+                "type": "kotlin",
+                "request": "attach",
+                "hostName": "localhost",
+                "port": 5005,
+                "projectRoot": "/project",
+                "timeout": 10000,
+            },
+        )
+        mock_fire.assert_any_call("setExceptionBreakpoints", {"filters": ["C", "U"]})
+        mock_fire.assert_any_call("configurationDone")
+        # attach + best-effort responses waited on
         mock_wait_resp.assert_any_call(1, "attach", timeout=30)
+        mock_wait_resp.assert_any_call(2, "setExceptionBreakpoints", timeout=3)
+        mock_wait_resp.assert_any_call(3, "configurationDone", timeout=3)
 
     @patch("linc_spectra.core.jdwp_bridge.adb_forward_jdwp")
     @patch("linc_spectra.core.jdwp_bridge.adb_list_jdwp_pids", return_value={1234})
@@ -219,6 +238,7 @@ class TestJDWPAttach:
                 "exceptionBreakpointFilters": [
                     {"filter": "C", "label": "Caught Exceptions", "default": False},
                     {"filter": "U", "label": "Uncaught Exceptions"},
+                    {"filter": "", "label": "Empty Filter", "default": True},
                 ]
             },
         }
@@ -226,10 +246,14 @@ class TestJDWPAttach:
         mock_wait_resp.return_value = {"success": True, "body": {}}
 
         bridge = JDWPBridge(adapter_path="/bin/kda")
-        bridge.attach("com.lincmobile.level", serial="ABC", project_root="/project")
+        client = bridge.attach("com.lincmobile.level", serial="ABC", project_root="")
 
+        assert client._cwd is None
         fired_commands = [call.args[0] for call in mock_fire.call_args_list]
         assert fired_commands == ["attach", "configurationDone"]
+        assert mock_wait_resp.call_count == 2
+        mock_wait_resp.assert_any_call(1, "attach", timeout=30)
+        mock_wait_resp.assert_any_call(2, "configurationDone", timeout=3)
 
     @patch("linc_spectra.core.jdwp_bridge.adb_remove_forward")
     @patch("linc_spectra.core.jdwp_bridge.adb_forward_jdwp")
@@ -354,3 +378,56 @@ class TestAwaitBestEffort:
             mock_logger.warning.assert_called_once_with(
                 "best_effort_error", command="setExceptionBreakpoints", error="Internal error."
             )
+
+
+class TestJDWPAdbFailures:
+    def test_find_debuggable_pid_propagates_adb_command_error_as_dap_error(self) -> None:
+        from linc_spectra.core.adb_subprocess import AdbCommandError
+
+        bridge = JDWPBridge(adapter_path="/bin/kda")
+        with (
+            patch(
+                "linc_spectra.core.jdwp_bridge.adb_get_pid",
+                side_effect=AdbCommandError("adb failed (exit code 1): device not found"),
+            ),
+            pytest.raises(DAPError, match="device not found"),
+        ):
+            bridge.find_debuggable_pid("com.example.app", serial="ABC")
+
+        with (
+            patch("linc_spectra.core.jdwp_bridge.adb_get_pid", return_value=1234),
+            patch(
+                "linc_spectra.core.jdwp_bridge.adb_list_jdwp_pids",
+                side_effect=AdbCommandError("adb failed (exit code 1): device offline"),
+            ),
+            pytest.raises(DAPError, match="device offline"),
+        ):
+            bridge.find_debuggable_pid("com.example.app", serial="ABC")
+
+    def test_attach_forward_called_process_error_carries_sanitized_stderr(self) -> None:
+        import subprocess
+
+        bridge = JDWPBridge(adapter_path="/bin/kda")
+        with (
+            patch.object(bridge, "find_debuggable_pid", return_value=1234),
+            patch(
+                "linc_spectra.core.jdwp_bridge.adb_forward_jdwp",
+                side_effect=subprocess.CalledProcessError(
+                    1, ["adb", "forward"], stderr="error: closed\n"
+                ),
+            ),
+            pytest.raises(
+                DAPError, match="Failed to forward port 5005 to JDWP PID 1234: error: closed"
+            ),
+        ):
+            bridge.attach("com.example.app", serial="ABC", port=5005)
+
+        with (
+            patch.object(bridge, "find_debuggable_pid", return_value=1234),
+            patch(
+                "linc_spectra.core.jdwp_bridge.adb_forward_jdwp",
+                side_effect=subprocess.CalledProcessError(1, ["adb", "forward"], stderr=""),
+            ),
+            pytest.raises(DAPError, match="Failed to forward port 5005 to JDWP PID 1234: Command"),
+        ):
+            bridge.attach("com.example.app", serial="ABC", port=5005)
